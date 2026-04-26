@@ -1,667 +1,761 @@
 """
-app.py — S&OP Agentique · Interface complète multi-onglets
-==========================================================
-5 onglets : Orchestrateur · Demande · Production · Marketing · Finance
-Chaque onglet : import fichier + chat IA + actions directes Excel
+app.py — S&OP Agentique · Version corrigée
+==========================================
+Corrections :
+- sys.path configuré AVANT tout import de module
+- Boutons gérés via st.session_state (pas de rerun prématuré)
+- Chaque agent a sa logique isolée
+- Messages d'erreur visibles si un module manque
 """
 
-import sys, os, json, re, warnings, tempfile
+import sys
+import os
+import re
+import warnings
+import tempfile
 from pathlib import Path
 from datetime import datetime
+
+# ── CRITIQUE : sys.path doit être configuré AVANT les imports de modules ──────
+APP_DIR = Path(__file__).parent.resolve()
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(0, str(APP_DIR))
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 
 warnings.filterwarnings("ignore")
-sys.path.append(str(Path(__file__).parent))
 
-# ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="S&OP Agentique", page_icon="⬡", layout="wide", initial_sidebar_state="collapsed")
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
+st.set_page_config(
+    page_title="S&OP Agentique",
+    page_icon="⬡",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-# ── Design system ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# CSS
+# ══════════════════════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700&display=swap');
 :root{
   --bg:#0a0a0b;--bg1:#111113;--bg2:#18181c;--bg3:#222228;
   --border:#2a2a32;--border2:#3a3a45;
   --text:#e8e8f0;--muted:#6b6b80;
-  --amber:#f59e0b;--amber2:#fbbf24;
-  --green:#10b981;--red:#ef4444;--blue:#3b82f6;--purple:#8b5cf6;
-  --pink:#ec4899;--orange:#f97316;
+  --amber:#f59e0b;--green:#10b981;--red:#ef4444;--blue:#3b82f6;
 }
-*{box-sizing:border-box}
-html,body,[class*="css"]{font-family:'Syne',sans-serif;background:var(--bg)!important;color:var(--text)}
+html,body,[class*="css"]{font-family:'Syne',sans-serif !important;background:var(--bg) !important;color:var(--text) !important}
 #MainMenu,footer,header{visibility:hidden}
-.block-container{padding:0!important;max-width:100%!important}
-section[data-testid="stSidebar"]{display:none!important}
+.block-container{padding:1rem !important;max-width:100% !important}
 
-/* Topbar */
-.topbar{background:var(--bg1);border-bottom:1px solid var(--border);padding:.7rem 1.5rem;display:flex;align-items:center;gap:1rem}
-.topbar-logo{font-family:'Space Mono',monospace;font-size:.95rem;font-weight:700;color:var(--amber);letter-spacing:.06em}
-.topbar-sep{width:1px;height:18px;background:var(--border2)}
-.topbar-sub{font-size:.75rem;color:var(--muted);font-family:'Space Mono',monospace}
+.topbar{background:var(--bg1);border:1px solid var(--border);border-radius:10px;padding:.7rem 1.2rem;display:flex;align-items:center;gap:1rem;margin-bottom:1rem}
+.topbar-logo{font-family:'Space Mono',monospace;font-size:.9rem;font-weight:700;color:var(--amber)}
+.topbar-sep{width:1px;height:16px;background:var(--border2)}
+.topbar-sub{font-size:.72rem;color:var(--muted);font-family:'Space Mono',monospace}
 
-/* Streamlit tab overrides */
-.stTabs [data-baseweb="tab-list"]{background:var(--bg1)!important;border-bottom:1px solid var(--border)!important;gap:0!important}
-.stTabs [data-baseweb="tab"]{background:transparent!important;color:var(--muted)!important;font-family:'Syne',sans-serif!important;font-size:.82rem!important;font-weight:600!important;padding:.7rem 1.3rem!important;border-bottom:2px solid transparent!important;border-radius:0!important}
-.stTabs [aria-selected="true"]{color:var(--amber)!important;border-bottom-color:var(--amber)!important;background:var(--bg2)!important}
-.stTabs [data-baseweb="tab-panel"]{background:var(--bg)!important;padding:0!important}
+.stTabs [data-baseweb="tab-list"]{background:var(--bg1) !important;border-radius:8px 8px 0 0;gap:0 !important}
+.stTabs [data-baseweb="tab"]{background:transparent !important;color:var(--muted) !important;font-family:'Syne',sans-serif !important;font-weight:600 !important;padding:.65rem 1.2rem !important;border-bottom:2px solid transparent !important;border-radius:0 !important;font-size:.82rem !important}
+.stTabs [aria-selected="true"]{color:var(--amber) !important;border-bottom-color:var(--amber) !important;background:var(--bg2) !important}
+.stTabs [data-baseweb="tab-panel"]{background:var(--bg) !important;padding:0 !important}
 
-/* Inputs */
-.stTextInput>div>div>input{background:var(--bg2)!important;border:1px solid var(--border2)!important;color:var(--text)!important;border-radius:6px!important;font-family:'Syne',sans-serif!important;font-size:.88rem!important}
-.stTextInput>div>div>input:focus{border-color:var(--amber)!important;box-shadow:0 0 0 1px var(--amber)!important}
-.stButton>button{background:var(--amber)!important;color:#0a0a0b!important;border:none!important;border-radius:6px!important;font-weight:700!important;font-family:'Syne',sans-serif!important;font-size:.82rem!important;padding:.4rem 1rem!important}
-.stButton>button:hover{opacity:.85!important}
-.stFileUploader>div{background:var(--bg2)!important;border:1px solid var(--border2)!important;border-radius:8px!important}
-.stFileUploader label{color:var(--muted)!important;font-size:.8rem!important}
+.agent-panel{background:var(--bg1);border:1px solid var(--border);border-radius:8px;padding:.75rem;height:100%}
+.sec-label{font-size:.67rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);font-family:'Space Mono',monospace;padding:.4rem 0 .6rem;border-bottom:1px solid var(--border);margin-bottom:.6rem}
 
-/* Section headers */
-.sec-hdr{padding:.55rem 1rem;font-size:.67rem;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);background:var(--bg1);border-bottom:1px solid var(--border);font-family:'Space Mono',monospace}
+.chat-area{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:.75rem;min-height:320px;max-height:400px;overflow-y:auto}
+.msg-user{display:flex;justify-content:flex-end;margin:.4rem 0}
+.msg-agent{display:flex;justify-content:flex-start;margin:.4rem 0}
+.bubble{padding:.55rem .85rem;border-radius:8px;font-size:.83rem;line-height:1.6;max-width:88%;border:1px solid var(--border)}
+.bubble-u{background:var(--bg3);color:var(--text)}
+.bubble-a{background:var(--bg1);color:var(--text)}
+.avatar{width:24px;height:24px;border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:.75rem;font-weight:700;flex-shrink:0;margin:.1rem .4rem 0}
 
-/* File badge */
-.fbadge{margin:.5rem 0;background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:.45rem .75rem;font-size:.76rem;font-family:'Space Mono',monospace;color:var(--green);display:flex;align-items:center;gap:.5rem}
+.stTextInput>div>div>input{background:var(--bg2) !important;border:1px solid var(--border2) !important;color:var(--text) !important;border-radius:6px !important;font-family:'Syne',sans-serif !important}
+.stTextInput>div>div>input:focus{border-color:var(--amber) !important;box-shadow:0 0 0 1px var(--amber) !important}
+.stButton>button{background:var(--bg2) !important;color:var(--text) !important;border:1px solid var(--border2) !important;border-radius:6px !important;font-weight:600 !important;font-family:'Syne',sans-serif !important;transition:all .15s !important}
+.stButton>button:hover{border-color:var(--amber) !important;color:var(--amber) !important}
+.btn-send>button{background:var(--amber) !important;color:#000 !important;border:none !important;font-weight:700 !important}
+.stFileUploader>div{background:var(--bg2) !important;border:1px solid var(--border2) !important;border-radius:8px !important}
 
-/* Chat messages */
-.chat-wrap{display:flex;flex-direction:column;gap:.6rem;padding:.75rem}
-.msg{display:flex;gap:.65rem;max-width:90%}
-.msg.u{align-self:flex-end;flex-direction:row-reverse}
-.msg.a{align-self:flex-start}
-.avatar{width:26px;height:26px;border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:.72rem;font-weight:700;flex-shrink:0;font-family:'Space Mono',monospace}
-.bubble{padding:.6rem .85rem;border-radius:8px;font-size:.83rem;line-height:1.6;border:1px solid var(--border)}
-.bubble.u{background:var(--bg2);color:var(--text);border-color:var(--border2)}
-.bubble.a{background:var(--bg1);color:var(--text)}
-.bubble.a strong{color:var(--amber)}
-.bubble.a code{background:var(--bg3);padding:.1rem .3rem;border-radius:3px;font-family:'Space Mono',monospace;font-size:.78em;color:var(--amber2)}
+.trace-item{padding:.35rem .6rem;border-bottom:1px solid var(--border);font-size:.76rem;display:flex;gap:.5rem;align-items:flex-start}
+.trace-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;margin-top:.3rem}
+.trace-agent{font-family:'Space Mono',monospace;font-size:.72rem;font-weight:700;min-width:75px;flex-shrink:0}
+.trace-msg{color:var(--muted);flex:1;line-height:1.4}
+.trace-ts{color:var(--border2);font-family:'Space Mono',monospace;font-size:.67rem;flex-shrink:0}
 
-/* Quick prompts */
-.qp-wrap{padding:.5rem .75rem;border-top:1px solid var(--border);display:flex;flex-wrap:wrap;gap:.35rem}
-.qp-lbl{font-size:.67rem;color:var(--muted);font-family:'Space Mono',monospace;letter-spacing:.08em;padding:.4rem 0 .2rem;width:100%}
+.fbadge{background:var(--bg2);border:1px solid var(--green);border-radius:5px;padding:.3rem .6rem;font-size:.75rem;font-family:'Space Mono',monospace;color:var(--green);margin:.4rem 0}
+.cap-item{padding:.25rem 0;font-size:.78rem;color:var(--muted);display:flex;gap:.4rem;align-items:center}
+.cap-dot{color:var(--amber);font-size:.6rem}
 
-/* Trace log */
-.trace-row{display:flex;align-items:flex-start;gap:.65rem;padding:.5rem 1rem;border-bottom:1px solid var(--border);font-size:.78rem}
-.trace-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;margin-top:.3rem}
-.trace-agent{font-weight:700;font-family:'Space Mono',monospace;min-width:85px;font-size:.75rem}
-.trace-msg{color:var(--muted);flex:1;line-height:1.45}
-.trace-time{color:var(--border2);font-family:'Space Mono',monospace;font-size:.68rem;flex-shrink:0}
+.warn-box{background:#2d1f00;border:1px solid var(--amber);border-radius:6px;padding:.5rem .75rem;font-size:.8rem;color:var(--amber);margin:.4rem 0}
+.err-box{background:#2d0a0a;border:1px solid var(--red);border-radius:6px;padding:.5rem .75rem;font-size:.8rem;color:var(--red);margin:.4rem 0}
 
-/* Capabilities list */
-.cap-item{padding:.35rem 1rem;font-size:.78rem;color:var(--muted);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:.5rem}
-.cap-item span{color:var(--amber)}
-
-/* Scrollbars */
-::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar{width:4px}
 ::-webkit-scrollbar-track{background:var(--bg1)}
 ::-webkit-scrollbar-thumb{background:var(--border2);border-radius:4px}
-
-/* Dataframe */
-.stDataFrame{background:var(--bg2)!important}
-.element-container .stDataFrame{font-size:.78rem}
 </style>
 """, unsafe_allow_html=True)
 
-# ── State ─────────────────────────────────────────────────────────────────────
-AGENT_KEYS = ["orchestrateur", "demande", "production", "marketing", "finance"]
-for k in ["files", "chats", "traces"]:
-    if k not in st.session_state:
-        st.session_state[k] = {} if k != "traces" else []
-for a in AGENT_KEYS:
-    if a not in st.session_state.chats:
-        st.session_state.chats[a] = []
-
-AGENTS = {
-    "orchestrateur": {"icon":"⬡", "label":"Orchestrateur","color":"#f59e0b","av_css":"background:#2d1f00;color:#f59e0b"},
-    "demande":       {"icon":"📈","label":"Demande",      "color":"#10b981","av_css":"background:#001a0f;color:#10b981"},
-    "production":    {"icon":"🏭","label":"Production",   "color":"#f97316","av_css":"background:#1f0d00;color:#f97316"},
-    "marketing":     {"icon":"📣","label":"Marketing",    "color":"#ec4899","av_css":"background:#1f0011;color:#ec4899"},
-    "finance":       {"icon":"💰","label":"Finance",      "color":"#3b82f6","av_css":"background:#00103f;color:#3b82f6"},
-}
-
-QUICK = {
-    "orchestrateur":["Lance une analyse S&OP complète","Simule une promotion -20%","Vérifie la capacité de production","La promo est-elle rentable ?","Analyse globale et recommandation"],
-    "demande":      ["Calcule le forecast 6 mois","Quelle est la meilleure méthode ?","Analyse la saisonnalité","Détecte les anomalies","Compare LES vs Holt-Winters"],
-    "production":   ["Analyse la capacité Fill-L1","Y a-t-il des surcharges ?","Optimise le plan de production","Simulation demande +30%","Quel est le stock de sécurité optimal ?"],
-    "marketing":    ["Simule une promo -20%","Quel est le meilleur mois ?","Compare promo -10% vs -30%","Calcule l'uplift attendu","Analyse la saisonnalité des ventes"],
-    "finance":      ["Calcule le ROI promotion","Le budget est-il respecté ?","Quel est le seuil de rentabilité ?","Alerte si marge < 10%","Simule le P&L ventes +20%"],
-}
-
-# ── Backends ──────────────────────────────────────────────────────────────────
-@st.cache_resource
-def load_be():
-    """Charge tous les modules agents de manière sécurisée."""
+# ══════════════════════════════════════════════════════════════════════════════
+# IMPORT MODULES AGENTS (robuste)
+# ══════════════════════════════════════════════════════════════════════════════
+def import_modules():
+    """Importe les modules agents. Retourne un dict avec les fonctions ou erreurs."""
     import importlib
-    base_dir = str(Path(__file__).parent)
-    if base_dir not in sys.path:
-        sys.path.insert(0, base_dir)
-
     result = {}
-    modules_attrs = {
-        "data_loader":     [("auto_load","auto_load"),("load_demand_file","load_dem"),("load_production_file","load_prod"),("get_clean_history","get_hist")],
-        "agent_demande":   [("run","rd"),("analyse_article","analyse_art")],
-        "agent_production":[("run","rp"),("analyse_capacity","analyse_cap"),("generate_adjusted_plan","gen_adj")],
-        "agent_marketing": [("run","rm"),("analyse_article_promo","analyse_promo")],
-        "agent_finance":   [("run","rf"),("compute_pl_scenario","compute_pl"),("estimate_financials_from_history","est_fin")],
-        "orchestrateur":   [("run","ro"),("detect_files","detect"),("synthesize","synth"),("SCENARIO_AGENTS","sc_agents")],
+    modules = {
+        "data_loader":      ["auto_load", "load_demand_file", "load_production_file", "get_clean_history"],
+        "agent_demande":    ["run", "analyse_article"],
+        "agent_production": ["run", "analyse_capacity", "generate_adjusted_plan"],
+        "agent_marketing":  ["run", "analyse_article_promo"],
+        "agent_finance":    ["run", "compute_pl_scenario", "estimate_financials_from_history"],
     }
-    warnings_list = []
-    for mod_name, attrs in modules_attrs.items():
+    aliases = {
+        "data_loader":      {"auto_load":"auto_load","load_demand_file":"load_dem","load_production_file":"load_prod","get_clean_history":"get_hist"},
+        "agent_demande":    {"run":"rd","analyse_article":"analyse_art"},
+        "agent_production": {"run":"rp","analyse_capacity":"analyse_cap","generate_adjusted_plan":"gen_adj"},
+        "agent_marketing":  {"run":"rm","analyse_article_promo":"analyse_promo"},
+        "agent_finance":    {"run":"rf","compute_pl_scenario":"compute_pl","estimate_financials_from_history":"est_fin"},
+    }
+    errors = []
+    for mod_name, attrs in modules.items():
         try:
             mod = importlib.import_module(mod_name)
-            for orig, alias in attrs:
-                result[alias] = getattr(mod, orig)
+            for attr in attrs:
+                alias = aliases[mod_name].get(attr, attr)
+                result[alias] = getattr(mod, attr)
         except Exception as e:
-            warnings_list.append(f"{mod_name}: {e}")
-    if warnings_list:
-        result["WARNINGS"] = warnings_list
+            errors.append(f"❌ {mod_name} : {e}")
+    result["_errors"] = errors
     return result
 
-BE = load_be()
+# Import une seule fois
+if "BE" not in st.session_state:
+    st.session_state.BE = import_modules()
+BE = st.session_state.BE
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def save_upload(agent, f):
-    tmp = Path(tempfile.mkdtemp()); dest = tmp / f.name
-    dest.write_bytes(f.read())
-    try: df_prev = pd.read_excel(str(dest), nrows=6)
-    except: df_prev = pd.DataFrame()
-    st.session_state.files[agent] = {"name": f.name, "path": str(dest), "df": df_prev}
+# ══════════════════════════════════════════════════════════════════════════════
+# STATE
+# ══════════════════════════════════════════════════════════════════════════════
+AGENTS = ["orchestrateur", "demande", "production", "marketing", "finance"]
+AGENT_CFG = {
+    "orchestrateur": {"icon":"⬡",  "label":"Orchestrateur","color":"#f59e0b","av":"background:#2d1f00;color:#f59e0b"},
+    "demande":       {"icon":"📈", "label":"Demande",       "color":"#10b981","av":"background:#001a0f;color:#10b981"},
+    "production":    {"icon":"🏭", "label":"Production",    "color":"#f97316","av":"background:#1f0d00;color:#f97316"},
+    "marketing":     {"icon":"📣", "label":"Marketing",     "color":"#ec4899","av":"background:#1f0011;color:#ec4899"},
+    "finance":       {"icon":"💰", "label":"Finance",       "color":"#3b82f6","av":"background:#00103f;color:#3b82f6"},
+}
+QUICK = {
+    "orchestrateur": ["Lance une analyse S&OP complète","Simule une promotion -20%","Vérifie la capacité de production","La promo -20% est-elle rentable ?"],
+    "demande":       ["Calcule le forecast 6 mois","Quelle est la meilleure méthode ?","Analyse la saisonnalité","Quel article a le MAPE le plus élevé ?"],
+    "production":    ["Analyse la capacité Fill-L1","Y a-t-il des surcharges ?","Calcule le MRP complet","Simulation demande +30%"],
+    "marketing":     ["Simule une promo -20%","Quel est le meilleur mois ?","Compare promo -10% vs -30%","Calcule l'uplift attendu"],
+    "finance":       ["Calcule le ROI promotion","Le budget est-il respecté ?","Quel est le seuil de rentabilité ?","Alerte si marge < 10%"],
+}
+CAPS = {
+    "orchestrateur": ["Coordination de tous les agents","Décision GO / NO-GO","Trace live des appels","Synthèse multi-agents"],
+    "demande":       ["Prévision LES / Holt-Winters / ARIMA","Classification auto des séries","Sélection par MAE/MAPE/RMSE","Détection anomalies & saisonnalité"],
+    "production":    ["Calcul MRP complet (8 indicateurs)","Détection surcharges & alertes","Ajustement plan de production","Simulation scenarios demande"],
+    "marketing":     ["Simulation promotions élasticité prix","Calcul uplift par article","Analyse saisonnalité réelle","Comparaison multi-scénarios"],
+    "finance":       ["Calcul P&L & ROI par scénario","Seuil de rentabilité automatique","Vérification budget promotion","Alertes marge & déficit"],
+}
+
+def init_state():
+    if "files"  not in st.session_state: st.session_state.files  = {}
+    if "chats"  not in st.session_state: st.session_state.chats  = {a: [] for a in AGENTS}
+    if "traces" not in st.session_state: st.session_state.traces = []
+    for a in AGENTS:
+        if a not in st.session_state.chats:
+            st.session_state.chats[a] = []
+
+init_state()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+def save_upload(agent, uploaded):
+    tmp  = Path(tempfile.mkdtemp())
+    dest = tmp / uploaded.name
+    dest.write_bytes(uploaded.getvalue())
+    try:    df_p = pd.read_excel(str(dest), nrows=6)
+    except: df_p = pd.DataFrame()
+    st.session_state.files[agent] = {"name": uploaded.name, "path": str(dest), "df": df_p}
     return str(dest)
 
-def gpath(agent):
-    return st.session_state.files.get(agent, {}).get("path")
-
-def all_paths():
-    return [v["path"] for v in st.session_state.files.values() if "path" in v]
-
 def add_msg(agent, role, content, excel=None):
-    st.session_state.chats[agent].append({"role":role,"content":content,"ts":datetime.now().isoformat(),"excel":excel})
+    st.session_state.chats[agent].append({
+        "role": role, "content": content,
+        "ts": datetime.now().isoformat(), "excel": excel
+    })
 
-def trace(agent, msg, status="info"):
-    ts = datetime.now().strftime("%H:%M:%S")
-    st.session_state.traces.append({"agent":agent,"msg":msg,"status":status,"ts":ts})
+def add_trace(agent, msg, status="info"):
+    st.session_state.traces.append({
+        "agent": agent, "msg": msg, "status": status,
+        "ts": datetime.now().strftime("%H:%M:%S")
+    })
 
-def auto_file(agent):
-    """Auto-détecte un fichier compatible pour cet agent parmi ceux uploadés."""
-    p = gpath(agent)
-    if p: return p
-    if "ERR" in BE: return None
-    for path in all_paths():
-        try:
-            d = BE["auto_load"](path)
-            if agent == "production" and d["type"] == "production": return path
-            if agent in ("demande","marketing","finance") and d["type"] == "demand": return path
-        except: pass
-    return all_paths()[0] if all_paths() else None
+def get_file(agent):
+    """Retourne le chemin du fichier pour un agent, avec auto-détection."""
+    p = st.session_state.files.get(agent, {}).get("path")
+    if p and Path(p).exists():
+        return p
+    # Auto-détection depuis les fichiers disponibles
+    if "auto_load" in BE:
+        for fp in [v["path"] for v in st.session_state.files.values() if "path" in v]:
+            try:
+                d = BE["auto_load"](fp)
+                if agent == "production" and d["type"] == "production": return fp
+                if agent in ("demande","marketing","finance") and d["type"] == "demand": return fp
+            except: pass
+    # Dernier recours : premier fichier disponible
+    paths = [v["path"] for v in st.session_state.files.values() if "path" in v]
+    return paths[0] if paths else None
 
-# ── Agent brain ───────────────────────────────────────────────────────────────
-def think(agent, question, file_path):
-    q = question.lower()
-    parts = []; excel_out = None
-    pct = next((int(m) for m in re.findall(r"(\d+)\s*%", q)), 20)
+def fmt_html(text):
+    """Convertit le markdown basique en HTML pour les bulles de chat."""
+    import html
+    text = html.escape(text)
+    text = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', text)
+    text = re.sub(r'`(.*?)`', r'<code style="background:#222;padding:.1rem .3rem;border-radius:3px;font-family:monospace;color:#fbbf24">\1</code>', text)
+    text = text.replace("\n", "<br>")
+    return text
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CERVEAU DE CHAQUE AGENT
+# ══════════════════════════════════════════════════════════════════════════════
+def think(agent: str, question: str) -> tuple:
+    """
+    Cerveau de l'agent : analyse la question, exécute, retourne (réponse, excel_path).
+    Toujours retourne quelque chose — jamais silencieux.
+    """
+    q = question.lower().strip()
+    parts = []
+    excel_out = None
+    fp = get_file(agent)
+
+    # Vérifie les imports
+    if BE.get("_errors"):
+        errs = [e for e in BE["_errors"] if agent.replace("_","") in e.lower() or "loader" in e.lower()]
+        if errs:
+            return f"⚠️ Module non chargé : {errs[0]}\n\nVérifie que tous les fichiers .py sont dans le même dossier.", None
 
     try:
-        # ── DEMANDE ──────────────────────────────────────────────────────────
+        # ══ AGENT DEMANDE ══════════════════════════════════════════════════════
         if agent == "demande":
-            if not file_path:
-                return "📁 Importe un fichier de demande pour que je puisse agir.", None
-            data = BE["load_dem"](file_path)
-            arts = data["articles"]
+            if not fp:
+                return "📁 **Importe un fichier Excel** de demande (ex: article_report_merged.xlsx) pour que je puisse analyser.", None
 
-            if any(w in q for w in ["forecast","prévision","prévoir","6 mois","futur"]):
-                parts.append(f"✅ **Calcul du forecast** — {len(arts)} article(s) :\n")
-                for aid, adata in arts.items():
+            data = BE["load_dem"](fp)
+            arts = data["articles"]
+            tc   = data["time_cols"]
+            n    = len(arts)
+
+            if not arts:
+                return "⚠️ Aucun article détecté dans le fichier. Vérifie la structure (colonnes Article + Data field).", None
+
+            pct = next((int(m) for m in re.findall(r"(\d+)\s*%", q)), 0)
+
+            if any(w in q for w in ["forecast","prévision","prévoir","futur","mois","calcule"]):
+                parts.append(f"✅ **Calcul du forecast — {n} article(s) :**\n")
+                tmp = str(Path(fp).parent / "output_dem.xlsx")
+                BE["rd"](context={"demand_file": fp, "output_path": tmp})
+                excel_out = tmp
+                # Résumé rapide
+                for aid, adata in list(arts.items())[:4]:
                     hist = BE["get_hist"](adata)
                     if len(hist) < 4: continue
-                    sel = BE["analyse_art"](aid, adata, {})
-                    if not sel: continue
-                    kpi_row = sel["all_results"][sel["all_results"]["Méthode"]==sel["best_method"]].iloc[0]
-                    fc_total = round(float(np.sum(sel["forecast"])),0)
-                    parts.append(f"**{aid}** → `{sel['best_method']}` | MAPE=`{kpi_row['MAPE(%)']:.1f}%` | Forecast 6M = **{fc_total:,.0f} U**")
-                tmp = str(Path(file_path).parent/"output_dem.xlsx")
-                BE["rd"](context={"demand_file":file_path,"output_path":tmp})
-                excel_out = tmp
+                    try:
+                        sel = BE["analyse_art"](aid, adata, {})
+                        if not sel: continue
+                        row = sel["all_results"][sel["all_results"]["Méthode"]==sel["best_method"]].iloc[0]
+                        parts.append(f"**{aid}** → `{sel['best_method']}` | MAPE=`{row['MAPE(%)']:.1f}%` | F6M=**{np.sum(sel['forecast']):,.0f} U**")
+                    except: pass
+                parts.append(f"\n📥 Fichier Excel généré avec le plan de demande complet.")
 
-            elif any(w in q for w in ["mape","kpi","qualité","erreur","anomalie","précision"]):
-                parts.append("**Audit qualité des prévisions :**\n")
+            elif any(w in q for w in ["mape","kpi","qualité","erreur","précision","audit","meilleur"]):
+                parts.append("**📊 Audit qualité des prévisions :**\n")
                 kdf = data.get("kpis")
-                if kdf is not None:
+                if kdf is not None and not kdf.empty:
                     for _, r in kdf.iterrows():
                         try:
                             mape = float(str(r.iloc[2]).replace(" ","").replace(",","."))
-                            st = "🔴 Mauvais (>50%)" if mape>50 else "🟡 Moyen" if mape>25 else "🟢 Bon"
-                            parts.append(f"**{r.iloc[0]}** — MAPE=`{mape:.1f}%` {st}")
+                            st_txt = "🔴 Mauvais" if mape>50 else ("🟡 Moyen" if mape>25 else "🟢 Bon")
+                            parts.append(f"**{r.iloc[0]}** — MAPE=`{mape:.1f}%` {st_txt}")
                         except: pass
                 else:
                     for aid, adata in arts.items():
                         hist = BE["get_hist"](adata)
                         if len(hist)>0:
                             cv = float(np.std(hist.values)/np.mean(hist.values)) if np.mean(hist.values)>0 else 0
-                            parts.append(f"**{aid}** — CV=`{cv:.2f}` | Moy=`{hist.mean():,.0f}` U | N=`{len(hist)}` mois")
+                            parts.append(f"**{aid}** — N=`{len(hist)}` mois | Moy=`{hist.mean():,.0f}` U | CV=`{cv:.2f}`")
 
-            elif any(w in q for w in ["saisonnalité","tendance","type","classif","pattern"]):
-                parts.append("**Classification des séries temporelles :**\n")
-                for aid, adata in arts.items():
-                    hist = BE["get_hist"](adata)
-                    if len(hist)<4: continue
-                    vals = hist.values.astype(float)
-                    z = np.sum(vals==0)/len(vals)
-                    cv = np.std(vals)/(np.mean(vals)+1e-9)
-                    typ = "intermittente" if z>0.5 else "saisonnière" if len(vals)>=24 else "stable" if cv<0.2 else "variable"
-                    parts.append(f"**{aid}** → Type: `{typ}` | CV=`{cv:.2f}` | N=`{len(hist)}` mois | Moy=`{hist.mean():,.0f}` U")
-
-            elif any(w in q for w in ["compare","les","holt","hw","arima","ma","méthode"]):
-                parts.append("**Comparaison des méthodes de prévision :**\n")
-                for aid, adata in list(arts.items())[:2]:
-                    hist = BE["get_hist"](adata)
-                    if len(hist)<4: continue
-                    sel = BE["analyse_art"](aid, adata, {})
-                    if not sel: continue
-                    parts.append(f"**{aid}** :")
-                    for _, row in sel["all_results"].iterrows():
-                        best_marker = " ← MEILLEUR" if row["Méthode"]==sel["best_method"] else ""
-                        parts.append(f"  `{row['Méthode']:30s}` MAE=`{row['MAE']:7.0f}` MAPE=`{row['MAPE(%)']:5.1f}%` Score=`{row['Score']:.4f}`{best_marker}")
-
-            else:
-                parts.append(f"Fichier `{Path(file_path).name}` — **{len(arts)} article(s)** | **{len(data['time_cols'])} périodes**")
-                for aid, adata in arts.items():
-                    hist = BE["get_hist"](adata)
-                    if len(hist)>0:
-                        parts.append(f"- `{aid}` : {len(hist)} mois | moy = `{hist.mean():,.0f}` U")
-                parts.append("\nSuggestions : forecast, qualité MAPE, saisonnalité, comparer les méthodes.")
-
-        # ── PRODUCTION ───────────────────────────────────────────────────────
-        elif agent == "production":
-            if not file_path:
-                return "📁 Importe un fichier MPS pour que je puisse agir.", None
-            data = BE["load_prod"](file_path)
-            arts = data["articles"]; tc = data["time_cols"]
-
-            if any(w in q for w in ["capacité","surcharge","charge","ressource","fill"]):
-                parts.append("**Analyse capacité & surcharges :**\n")
-                for aid, adict in arts.items():
-                    dfc = BE["analyse_cap"](aid, adict, tc, {})
-                    dfa = BE["gen_adj"](dfc, adict)
-                    sur = dfa[dfa["Statut"].str.contains("SURCHARGE", na=False)]
-                    ale = dfa[dfa["Statut"].str.contains("ALERTE", na=False)]
-                    parts.append(f"**Article {aid}** — {len(tc)} périodes :")
-                    if len(sur)>0: parts.append(f"  🔴 **{len(sur)} surcharge(s)** : `{'`, `'.join(sur['Période'].head(4).tolist())}`")
-                    if len(ale)>0: parts.append(f"  🟡 **{len(ale)} alerte(s)** de capacité")
-                    if len(sur)==0 and len(ale)==0: parts.append("  🟢 Capacité suffisante sur tout l'horizon")
-                tmp = str(Path(file_path).parent/"output_prod.xlsx")
-                BE["rp"](context={"prod_file":file_path,"output_path":tmp})
-                excel_out = tmp
-
-            elif any(w in q for w in ["optimise","ajuste","plan","corrige"]):
-                parts.append("**Optimisation du plan de production :**\n")
-                for aid, adict in arts.items():
-                    dfc = BE["analyse_cap"](aid, adict, tc, {})
-                    dfa = BE["gen_adj"](dfc, adict)
-                    if "Action" in dfa.columns:
-                        adj = dfa[dfa["Action"].str.contains("Réduit", na=False)]
-                        parts.append(f"**{aid}** — {len(adj)} ajustement(s) effectué(s) :")
-                        for _, r in adj.head(4).iterrows():
-                            parts.append(f"  ↳ `{r['Période']}` : {r['Action']}")
-                        if len(adj)==0: parts.append(f"  ✅ Aucun ajustement nécessaire")
-                tmp = str(Path(file_path).parent/"output_prod.xlsx")
-                BE["rp"](context={"prod_file":file_path,"output_path":tmp})
-                excel_out = tmp
-
-            elif any(w in q for w in ["30%","20%","hausse","augmente","scénario","simulation"]):
-                parts.append(f"**Simulation demande +{pct}% :**\n")
-                for aid, adict in arts.items():
-                    dfc = BE["analyse_cap"](aid, adict, tc, {})
-                    sur_avant = len(dfc[dfc["Statut"].str.contains("SURCHARGE", na=False)])
-                    # Simulation boost
-                    adict_boost = {}
-                    for k, s in adict.items():
-                        if "gross" in k.lower():
-                            adict_boost[k] = s * (1+pct/100)
-                        else:
-                            adict_boost[k] = s
-                    dfc2 = BE["analyse_cap"](aid, adict_boost, tc, {})
-                    sur_apres = len(dfc2[dfc2["Statut"].str.contains("SURCHARGE", na=False)])
-                    verdict = f"⚠️ {sur_apres} surcharge(s) → action requise" if sur_apres>0 else "✅ Capacité absorbable"
-                    parts.append(f"**{aid}** : avant={sur_avant} surcharge(s) → après +{pct}%: **{sur_apres} surcharge(s)** — {verdict}")
-
-            else:
-                parts.append(f"Fichier `{Path(file_path).name}` — **{len(arts)} article(s)** | **{len(tc)} périodes**")
-                for aid, adict in arts.items():
-                    parts.append(f"- `{aid}` : {len(list(adict.keys()))} indicateurs MPS")
-                parts.append("\nSuggestions : capacité, surcharges, optimiser le plan, simulation +30%.")
-
-        # ── MARKETING ────────────────────────────────────────────────────────
-        elif agent == "marketing":
-            if not file_path:
-                return "📁 Importe un fichier de données pour que je puisse agir.", None
-            data = BE["load_dem"](file_path); arts = data["articles"]
-
-            if any(w in q for w in ["promo","remise","discount","réduction","simulation","-20","-10","-30"]):
-                parts.append(f"**Simulation promotion -{pct}% :**\n")
-                ctx = {"discount_pct":pct,"promo_horizon":3,"price_elasticity":-1.5}
-                for aid, adata in arts.items():
-                    a = BE["analyse_promo"](aid, adata, ctx.copy())
-                    parts.append(f"**{aid}** → Uplift max=`+{a['uplift_max_pct']:.1f}%` | Pic=`{a['demand_peak']:,.0f} U` | Base=`{a['base_demand']:,.0f} U/mois`")
-                tmp = str(Path(file_path).parent/"output_mkt.xlsx")
-                BE["rm"](context={**ctx,"demand_file":file_path,"output_path":tmp})
-                excel_out = tmp
-
-            elif any(w in q for w in ["saisonnalité","meilleur mois","saison","période"]):
-                parts.append("**Analyse saisonnalité — meilleurs mois pour une promotion :**\n")
+            elif any(w in q for w in ["saisonnalité","tendance","type","classif","saison"]):
+                parts.append("**🔍 Classification des séries temporelles :**\n")
                 MONTHS=["Jan","Fév","Mar","Avr","Mai","Jun","Jul","Aoû","Sep","Oct","Nov","Déc"]
                 for aid, adata in arts.items():
                     hist = BE["get_hist"](adata)
-                    if len(hist)<12: continue
+                    if len(hist)<4: continue
                     vals = hist.values.astype(float)
-                    monthly = {}
-                    for i,v in enumerate(vals):
-                        if v>0: monthly.setdefault(i%12,[]).append(v)
-                    mean_all = np.mean([v for v in vals if v>0])
-                    factors = {m:round(np.mean(vs)/mean_all,2) for m,vs in monthly.items()}
-                    best=max(factors,key=factors.get); worst=min(factors,key=factors.get)
-                    parts.append(f"**{aid}** → Meilleur: `{MONTHS[best]}` ({factors[best]:.2f}x) | Moins bon: `{MONTHS[worst]}` ({factors[worst]:.2f}x)")
+                    z  = np.sum(vals==0)/len(vals)
+                    cv = np.std(vals)/(np.mean(vals)+1e-9)
+                    typ = "intermittente" if z>0.5 else ("saisonnière" if len(vals)>=24 else ("stable" if cv<0.2 else "variable"))
+                    parts.append(f"**{aid}** → Type: `{typ}` | CV=`{cv:.2f}` | Moy=`{hist.mean():,.0f}` U | N=`{len(hist)}`")
 
-            elif any(w in q for w in ["compare","vs","versus","scénarios","plusieurs"]):
-                parts.append("**Comparaison scénarios promotion :**\n")
-                art_id = list(arts.keys())[0]; art_data = list(arts.values())[0]
-                for pct_t in [10,15,20,25,30]:
-                    ctx = {"discount_pct":pct_t,"promo_horizon":3,"price_elasticity":-1.5}
-                    a = BE["analyse_promo"](art_id, art_data, ctx.copy())
-                    parts.append(f"  **-{pct_t}%** → Uplift `+{a['uplift_max_pct']:.1f}%` | Pic `{a['demand_peak']:,.0f} U`")
+            elif any(w in q for w in ["compare","les","holt","arima","méthode","modèle"]):
+                parts.append("**⚖️ Comparaison des méthodes de prévision :**\n")
+                for aid, adata in list(arts.items())[:2]:
+                    hist = BE["get_hist"](adata)
+                    if len(hist)<4: continue
+                    try:
+                        sel = BE["analyse_art"](aid, adata, {})
+                        if not sel: continue
+                        parts.append(f"**{aid}** :")
+                        for _, row in sel["all_results"].iterrows():
+                            best = " ✅ MEILLEUR" if row["Méthode"]==sel["best_method"] else ""
+                            parts.append(f"  `{row['Méthode']:30s}` MAE=`{row['MAE']:8.0f}` MAPE=`{row['MAPE(%)']:5.1f}%`{best}")
+                    except: pass
 
             else:
-                parts.append(f"Fichier `{Path(file_path).name}` — **{len(arts)} article(s)**")
-                parts.append("Suggestions : simuler une promo, analyser la saisonnalité, comparer des scénarios.")
-
-        # ── FINANCE ──────────────────────────────────────────────────────────
-        elif agent == "finance":
-            if not file_path:
-                return "📁 Importe un fichier de données pour que je puisse agir.", None
-            data = BE["load_dem"](file_path); arts = data["articles"]
-
-            if any(w in q for w in ["roi","rentab","p&l","marge","profit","ventes +","ventes+"]):
-                discount = pct if any(w in q for w in ["promo","remise","discount"]) else 0
-                parts.append(f"**Calcul P&L & ROI{' promo -'+str(discount)+'%' if discount else ''} :**\n")
-                for aid, adata in arts.items():
+                parts.append(f"📂 Fichier `{Path(fp).name}` chargé — **{n} article(s)** | **{len(tc)} périodes**\n")
+                for aid, adata in list(arts.items())[:4]:
                     hist = BE["get_hist"](adata)
-                    fin = BE["est_fin"](hist)
-                    base = float(hist.mean()) if len(hist)>0 else 1000
-                    ctx = {"discount_pct":discount,"demand_forecast":[base]*3,
-                           "uplift_pcts":[20,14,8] if discount else [0,0,0]}
-                    df_pl = BE["compute_pl"](aid, fin, ctx)
-                    roi = df_pl["ROI (%)"].mean(); mg = df_pl["Taux marge (%)"].mean()
-                    verdict = "✅ Rentable" if roi>10 else "⚠️ ROI faible" if roi>0 else "❌ Non rentable"
-                    parts.append(f"**{aid}** → ROI moy=`{roi:.1f}%` | Marge=`{mg:.1f}%` {verdict}")
-                tmp = str(Path(file_path).parent/"output_fin.xlsx")
-                BE["rf"](context={"demand_file":file_path,"discount_pct":discount,"output_path":tmp})
+                    if len(hist)>0:
+                        parts.append(f"- `{aid}` : {len(hist)} mois | moy=`{hist.mean():,.0f}` U")
+                parts.append("\n💡 Suggestions : *forecast 6 mois*, *audit MAPE*, *saisonnalité*, *comparer méthodes*")
+
+        # ══ AGENT PRODUCTION ══════════════════════════════════════════════════
+        elif agent == "production":
+            if not fp:
+                return "📁 **Importe un fichier MPS Excel** (ex: exemple_prod.xlsx) pour que je puisse calculer le MRP.", None
+
+            data = BE["load_prod"](fp)
+            arts = data["articles"]
+            tc   = data["time_cols"]
+
+            if any(w in q for w in ["mrp","complet","calcule","manquant","surcharge","capacité","charge","fill","alerte"]):
+                parts.append(f"🏭 **Calcul MRP complet — {len(arts)} article(s) :**\n")
+                tmp = str(Path(fp).parent / "output_prod_complet.xlsx")
+                result = BE["rp"](context={"prod_file": fp, "output_path": tmp})
                 excel_out = tmp
 
-            elif any(w in q for w in ["seuil","rentabilité","break even","budget"]):
-                parts.append("**Analyse seuil de rentabilité :**\n")
-                for aid, adata in arts.items():
-                    hist = BE["get_hist"](adata)
-                    fin = BE["est_fin"](hist)
-                    prix=fin["price_per_unit"]; cout=fin["cost_per_unit"]; fixed=fin["fixed_costs_month"]
-                    seuil = fixed/(prix-cout) if (prix-cout)>0 else 0
-                    base = float(hist.mean()) if len(hist)>0 else 0
-                    ok = base>=seuil
-                    parts.append(f"**{aid}** → Prix=`{prix:.2f}€` | Coût=`{cout:.2f}€` | Charges fixes=`{fixed:,.0f}€/mois`")
-                    parts.append(f"  Seuil de rentabilité = **`{seuil:,.0f} U/mois`** | Ventes moy=`{base:,.0f}` → {'✅ AU-DESSUS' if ok else '⚠️ EN-DESSOUS'}")
+                for art_id in arts.keys():
+                    n_sur = result.get("surcharges_detectees", 0)
+                    n_ale = result.get("alertes_detectees", 0)
+                    parts.append(f"**{art_id}** — {len(tc)} périodes analysées :")
+                    if n_sur > 0:
+                        periods = result.get("periodes_surcharge", [])
+                        parts.append(f"  🔴 **{n_sur} surcharge(s)** : `{'`, `'.join(str(p) for p in periods[:4])}{'...' if len(periods)>4 else ''}`")
+                    if n_ale > 0:
+                        parts.append(f"  🟡 **{n_ale} alerte(s)** capacité")
+                    if n_sur == 0 and n_ale == 0:
+                        parts.append("  🟢 Capacité suffisante sur tout l'horizon")
+                    parts.append(f"\n✅ Fichier Excel complet généré avec :")
+                    for c in result.get("calculs_ajoutes", []):
+                        parts.append(f"  · {c}")
 
-            elif any(w in q for w in ["alerte","surveill","déficit","risque"]):
-                parts.append("**Surveillance financière automatique :**\n")
-                for aid, adata in arts.items():
-                    hist = BE["get_hist"](adata)
-                    fin = BE["est_fin"](hist)
-                    base = float(hist.mean()) if len(hist)>0 else 1000
-                    ctx = {"discount_pct":0,"demand_forecast":[base]*3,"uplift_pcts":[0,0,0]}
-                    df_pl = BE["compute_pl"](aid, fin, ctx)
-                    deficits = df_pl[df_pl["Marge promo (€)"]<0]
-                    faibles = df_pl[df_pl["Taux marge (%)"]<10]
-                    if len(deficits)>0: parts.append(f"  🔴 **{aid}** : {len(deficits)} mois déficitaire(s)")
-                    elif len(faibles)>0: parts.append(f"  🟡 **{aid}** : marge < 10% sur {len(faibles)} mois")
-                    else: parts.append(f"  🟢 **{aid}** : finances saines")
+            elif any(w in q for w in ["optimise","ajuste","plan","corrige","stock"]):
+                parts.append("**🔧 Optimisation du plan de production :**\n")
+                tmp = str(Path(fp).parent / "output_prod_complet.xlsx")
+                result = BE["rp"](context={"prod_file": fp, "output_path": tmp})
+                excel_out = tmp
+                n_adj = result.get("surcharges_detectees", 0)
+                parts.append(f"**{n_adj} période(s) ajustée(s)** — plan réduit aux limites de capacité.")
+                parts.append("📥 Fichier Excel mis à jour avec le plan ajusté.")
+
+            elif any(w in q for w in ["30%","20%","simulation","hausse","augmente","scénario"]):
+                pct = next((int(m) for m in re.findall(r"(\d+)\s*%", q)), 30)
+                parts.append(f"**📊 Simulation demande +{pct}% :**\n")
+                for aid, adict in arts.items():
+                    df_cap  = BE["analyse_cap"](aid, adict, tc, {"demand_boost": 1+pct/100})
+                    surcharges = df_cap[df_cap["Statut"].str.contains("SURCHARGE", na=False)]
+                    verdict = f"⚠️ **{len(surcharges)} surcharge(s)** → capacité insuffisante" if len(surcharges)>0 else "✅ Capacité absorbable"
+                    parts.append(f"**{aid}** → +{pct}% : {verdict}")
 
             else:
-                parts.append(f"Fichier `{Path(file_path).name}` — **{len(arts)} article(s)**")
-                parts.append("Suggestions : ROI, seuil de rentabilité, alertes marges, P&L promotion.")
+                parts.append(f"📂 Fichier `{Path(fp).name}` chargé — **{len(arts)} article(s)** | **{len(tc)} périodes**\n")
+                for aid, adict in arts.items():
+                    parts.append(f"- Article `{aid}` : {len(adict)} indicateurs MPS détectés")
+                parts.append("\n💡 Suggestions : *calcule le MRP complet*, *Y a-t-il des surcharges ?*, *simulation +30%*")
+
+        # ══ AGENT MARKETING ═══════════════════════════════════════════════════
+        elif agent == "marketing":
+            if not fp:
+                return "📁 **Importe un fichier Excel** de demande pour analyser les promotions.", None
+
+            data = BE["load_dem"](fp)
+            arts = data["articles"]
+            pct  = next((int(m) for m in re.findall(r"(\d+)\s*%", q)), 20)
+
+            if any(w in q for w in ["promo","remise","discount","réduction","simulation","uplift"]):
+                parts.append(f"**📣 Simulation promotion -{pct}% — {len(arts)} article(s) :**\n")
+                ctx = {"discount_pct": pct, "promo_horizon": 3, "price_elasticity": -1.5}
+                tmp = str(Path(fp).parent / "output_mkt.xlsx")
+                BE["rm"](context={**ctx, "demand_file": fp, "output_path": tmp})
+                excel_out = tmp
+                for aid, adata in arts.items():
+                    try:
+                        a = BE["analyse_promo"](aid, adata, ctx.copy())
+                        parts.append(f"**{aid}** → Uplift max=`+{a['uplift_max_pct']:.1f}%` | Pic=`{a['demand_peak']:,.0f}` U | Base=`{a['base_demand']:,.0f}` U/mois")
+                    except: pass
+                parts.append("\n📥 Fichier Excel généré avec détail mois par mois.")
+
+            elif any(w in q for w in ["saisonnalité","meilleur mois","saison","période","timing"]):
+                parts.append("**📅 Meilleurs mois pour une promotion :**\n")
+                MONTHS = ["Jan","Fév","Mar","Avr","Mai","Jun","Jul","Aoû","Sep","Oct","Nov","Déc"]
+                for aid, adata in arts.items():
+                    hist = BE["get_hist"](adata)
+                    if len(hist) < 12: continue
+                    vals = hist.values.astype(float)
+                    monthly = {}
+                    for i, v in enumerate(vals):
+                        if v > 0: monthly.setdefault(i%12, []).append(v)
+                    mean_all = np.mean([v for v in vals if v>0])
+                    factors  = {m: round(np.mean(vs)/mean_all, 2) for m,vs in monthly.items()}
+                    best  = max(factors, key=factors.get)
+                    worst = min(factors, key=factors.get)
+                    parts.append(f"**{aid}** → 📈 Meilleur: `{MONTHS[best]}` ({factors[best]:.2f}x) | 📉 Moins bon: `{MONTHS[worst]}` ({factors[worst]:.2f}x)")
+
+            elif any(w in q for w in ["compare","vs","versus","scénarios","plusieurs"]):
+                parts.append("**⚖️ Comparaison scénarios promotion :**\n")
+                art_id   = list(arts.keys())[0]
+                art_data = list(arts.values())[0]
+                for pct_t in [10, 15, 20, 25, 30]:
+                    ctx = {"discount_pct": pct_t, "promo_horizon": 3, "price_elasticity": -1.5}
+                    try:
+                        a = BE["analyse_promo"](art_id, art_data, ctx.copy())
+                        parts.append(f"  **-{pct_t}%** → Uplift `+{a['uplift_max_pct']:.1f}%` | Pic `{a['demand_peak']:,.0f}` U")
+                    except: pass
+
+            else:
+                parts.append(f"📂 Fichier chargé — **{len(arts)} article(s)**\n")
+                parts.append("💡 Suggestions : *simuler une promo -20%*, *meilleur mois pour une promo*, *comparer scénarios*")
+
+        # ══ AGENT FINANCE ══════════════════════════════════════════════════════
+        elif agent == "finance":
+            if not fp:
+                return "📁 **Importe un fichier Excel** de demande pour l'analyse financière.", None
+
+            data = BE["load_dem"](fp)
+            arts = data["articles"]
+            pct  = next((int(m) for m in re.findall(r"(\d+)\s*%", q)), 0)
+            has_promo = any(w in q for w in ["promo","remise","discount"])
+            discount  = pct if has_promo else 0
+
+            if any(w in q for w in ["roi","rentab","p&l","marge","profit","calcule"]):
+                parts.append(f"**💰 Calcul P&L & ROI{' promo -'+str(discount)+'%' if discount else ''} :**\n")
+                tmp = str(Path(fp).parent / "output_fin.xlsx")
+                result = BE["rf"](context={"demand_file": fp, "discount_pct": discount, "output_path": tmp})
+                excel_out = tmp
+                for aid, adata in arts.items():
+                    hist = BE["get_hist"](adata)
+                    fin  = BE["est_fin"](hist)
+                    base = float(hist.mean()) if len(hist)>0 else 1000
+                    ctx  = {"discount_pct": discount, "demand_forecast": [base]*3, "uplift_pcts": [20,14,8] if discount else [0,0,0]}
+                    df_pl = BE["compute_pl"](aid, fin, ctx)
+                    roi   = df_pl["ROI (%)"].mean()
+                    mg    = df_pl["Taux marge (%)"].mean()
+                    verdict = "✅ Rentable" if roi>10 else ("⚠️ ROI faible" if roi>0 else "❌ Non rentable")
+                    parts.append(f"**{aid}** → ROI=`{roi:.1f}%` | Marge=`{mg:.1f}%` {verdict}")
+                parts.append("\n📥 Fichier Excel P&L généré.")
+
+            elif any(w in q for w in ["seuil","rentabilité","break","budget"]):
+                parts.append("**📐 Seuil de rentabilité :**\n")
+                for aid, adata in arts.items():
+                    hist = BE["get_hist"](adata)
+                    fin  = BE["est_fin"](hist)
+                    prix  = fin["price_per_unit"]; cout = fin["cost_per_unit"]; fixed = fin["fixed_costs_month"]
+                    seuil = fixed/(prix-cout) if (prix-cout)>0 else 0
+                    base  = float(hist.mean()) if len(hist)>0 else 0
+                    ok    = base >= seuil
+                    parts.append(f"**{aid}** → Prix=`{prix:.2f}€` | Coût=`{cout:.2f}€` | Seuil=**`{seuil:,.0f}` U/mois** → {'✅ Au-dessus' if ok else '⚠️ En-dessous'} (ventes=`{base:,.0f}`)")
+
+            elif any(w in q for w in ["alerte","surveill","déficit","risque","marge <"]):
+                parts.append("**🔔 Surveillance financière :**\n")
+                for aid, adata in arts.items():
+                    hist = BE["get_hist"](adata)
+                    fin  = BE["est_fin"](hist)
+                    base = float(hist.mean()) if len(hist)>0 else 1000
+                    ctx  = {"discount_pct":0,"demand_forecast":[base]*3,"uplift_pcts":[0,0,0]}
+                    df_pl = BE["compute_pl"](aid, fin, ctx)
+                    defs  = df_pl[df_pl["Marge promo (€)"]<0]
+                    fbles = df_pl[df_pl["Taux marge (%)"]<10]
+                    if len(defs)>0:  parts.append(f"  🔴 **{aid}** : {len(defs)} mois déficitaire(s)")
+                    elif len(fbles)>0: parts.append(f"  🟡 **{aid}** : marge < 10% sur {len(fbles)} mois")
+                    else:              parts.append(f"  🟢 **{aid}** : finances saines")
+
+            else:
+                parts.append(f"📂 Fichier chargé — **{len(arts)} article(s)**\n")
+                parts.append("💡 Suggestions : *calcule le ROI*, *seuil de rentabilité*, *alerte si marge < 10%*")
 
         else:
             parts.append(f"Agent `{agent}` prêt. Pose-moi une question sur tes données.")
 
     except Exception as e:
-        parts.append(f"⚠️ Erreur lors de l'analyse : `{e}`")
-        import traceback; parts.append(f"```\n{traceback.format_exc()[-400:]}\n```")
+        import traceback
+        tb = traceback.format_exc()
+        parts.append(f"❌ **Erreur lors de l'analyse :**\n`{e}`\n\n```\n{tb[-500:]}\n```")
 
-    return "\n\n".join(parts), excel_out
+    return "\n\n".join(parts) if parts else "Analyse terminée.", excel_out
 
 
-def do_orchestrate(question, ctx={}):
+def orchestrate(question: str) -> str:
+    """Orchestrateur : décide les agents, les appelle, synthétise."""
     q = question.lower()
-    trace("orchestrateur", f"Demande reçue : « {question[:55]}{'...' if len(question)>55 else ''} »")
+    add_trace("orchestrateur", f"Demande : « {question[:50]}{'...' if len(question)>50 else ''} »")
 
     if any(w in q for w in ["promo","remise","discount","simulation"]):
         agents = ["marketing","demande","production","finance"]
-        trace("orchestrateur","Scénario PROMOTION → 4 agents mobilisés","decision")
-    elif any(w in q for w in ["capacité","surcharge","prod","plan"]):
+        add_trace("orchestrateur", "Scénario PROMOTION → 4 agents", "decision")
+    elif any(w in q for w in ["capacité","surcharge","production","mrp","plan"]):
         agents = ["production"]
-        trace("orchestrateur","Scénario CAPACITÉ → Agent Production","decision")
-    elif any(w in q for w in ["forecast","prévision","demande","méthode","mape"]):
+        add_trace("orchestrateur", "Scénario PRODUCTION → Agent Production", "decision")
+    elif any(w in q for w in ["forecast","prévision","demande","mape","méthode"]):
         agents = ["demande"]
-        trace("orchestrateur","Scénario DEMANDE → Agent Demande","decision")
+        add_trace("orchestrateur", "Scénario DEMANDE → Agent Demande", "decision")
     elif any(w in q for w in ["roi","rentab","marge","finance","coût","budget"]):
         agents = ["finance"]
-        trace("orchestrateur","Scénario FINANCE → Agent Finance","decision")
+        add_trace("orchestrateur", "Scénario FINANCE → Agent Finance", "decision")
     else:
         agents = ["demande","production"]
-        trace("orchestrateur","Question générale → Demande + Production","decision")
+        add_trace("orchestrateur", "Analyse générale → Demande + Production", "decision")
 
-    results = {}
+    lines = [f"J'ai mobilisé **{len(agents)} agent(s)** : {', '.join([AGENT_CFG[a]['icon']+' '+a.capitalize() for a in agents])}\n"]
     for ag in agents:
-        trace(ag, "Démarrage de l'analyse...", "start")
-        fp = auto_file(ag)
-        resp, excel = think(ag, question, fp)
-        results[ag] = {"resp": resp, "excel": excel}
-        trace(ag, resp[:120].replace("\n"," ").replace("**","")+"...", "success")
+        add_trace(ag, "Analyse en cours...", "start")
+        resp, excel = think(ag, question)
+        first_line  = resp.split("\n")[0].replace("**","").replace("`","")[:80]
+        lines.append(f"{AGENT_CFG[ag]['icon']} **{ag.capitalize()}** → {first_line}")
+        # Stocke aussi dans le chat de l'agent
+        add_msg(ag, "user", f"[Via Orchestrateur] {question}")
+        add_msg(ag, "agent", resp, excel=excel)
+        add_trace(ag, first_line[:80], "success")
 
-    # Synthèse
-    trace("orchestrateur", "Synthèse des résultats en cours...", "synthesis")
-    pct = next((int(m) for m in re.findall(r"(\d+)\s*%", q)), 20)
-
-    lines = [f"J'ai mobilisé **{len(agents)} agent(s)** : {', '.join([AGENTS[a]['icon']+' '+a.capitalize() for a in agents])}\n"]
-    for ag in agents:
-        r = results[ag]
-        cfg = AGENTS[ag]
-        first_line = r["resp"].split("\n")[0].replace("**","").replace("`","")[:80]
-        lines.append(f"{cfg['icon']} **{ag.capitalize()}** → {first_line}")
-
-    # Décision finale
-    has_fin = "finance" in results and results["finance"]["resp"]
-    if has_fin and "Rentable" in results["finance"]["resp"]:
-        lines.append("\n**Décision finale : ✅ GO — Conditions favorables**")
-    elif has_fin and "Non rentable" in results["finance"]["resp"]:
-        lines.append("\n**Décision finale : ❌ NO-GO — Vérifier la rentabilité**")
+    add_trace("orchestrateur", "Synthèse terminée", "synthesis")
+    # Décision simple
+    if "finance" in agents:
+        lines.append("\n**Décision :** Consulte l'onglet Finance pour le verdict ROI complet.")
     else:
-        lines.append("\n**Analyse complète disponible — consulte chaque onglet agent.**")
+        lines.append("\n**Résultats disponibles** dans chaque onglet agent.")
 
-    trace("orchestrateur", lines[-1].replace("**","").replace("\n",""), "decision")
-    return "\n".join(lines), agents, results
+    return "\n".join(lines)
 
 
-# ── Render helpers ────────────────────────────────────────────────────────────
-def render_msgs(agent):
-    for m in st.session_state.chats[agent]:
-        cfg = AGENTS[agent]
+# ══════════════════════════════════════════════════════════════════════════════
+# COMPOSANTS UI
+# ══════════════════════════════════════════════════════════════════════════════
+def render_chat(agent):
+    msgs = st.session_state.chats.get(agent, [])
+    cfg  = AGENT_CFG[agent]
+    if not msgs:
+        st.markdown('<div style="color:var(--muted);font-size:.82rem;padding:.5rem;text-align:center">💬 Pose une question ou utilise une suggestion ci-dessous</div>', unsafe_allow_html=True)
+        return
+    for m in msgs:
         if m["role"] == "user":
-            st.markdown(f'<div class="chat-wrap"><div class="msg u"><div class="avatar" style="background:var(--bg3);color:var(--muted)">U</div><div class="bubble u">{m["content"]}</div></div></div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="msg-user"><div class="bubble bubble-u">{fmt_html(m["content"])}</div>'
+                f'<div class="avatar" style="background:var(--bg3);color:var(--muted)">U</div></div>',
+                unsafe_allow_html=True)
         else:
-            content_html = m["content"].replace("\n","<br>").replace("**","<strong>",1)
-            # Fix unclosed strong tags
-            import re as _re
-            content_html = _re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', m["content"].replace("\n","<br>"))
-            content_html = content_html.replace("`","<code>",1).replace("`","</code>",1)
-            content_html = _re.sub(r'`(.*?)`', r'<code>\1</code>', m["content"].replace("\n","<br>"))
-            st.markdown(f'<div class="chat-wrap"><div class="msg a"><div class="avatar" style="{cfg["av_css"]}">{cfg["icon"]}</div><div class="bubble a">{content_html}</div></div></div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="msg-agent"><div class="avatar" style="{cfg["av"]}">{cfg["icon"]}</div>'
+                f'<div class="bubble bubble-a">{fmt_html(m["content"])}</div></div>',
+                unsafe_allow_html=True)
             if m.get("excel") and Path(m["excel"]).exists():
                 with open(m["excel"],"rb") as f:
-                    st.download_button(f"⬇ Excel modifié — {Path(m['excel']).name}", data=f.read(),
-                                       file_name=Path(m["excel"]).name,
-                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                       key=f"dl_{agent}_{m['ts']}")
+                    st.download_button(
+                        f"⬇ Télécharger Excel — {Path(m['excel']).name}",
+                        data=f.read(),
+                        file_name=Path(m["excel"]).name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"dl_{agent}_{m['ts']}",
+                    )
 
-def render_file_panel(agent):
-    st.markdown('<div class="sec-hdr">📁 SOURCE DE DONNÉES</div>', unsafe_allow_html=True)
-    fi = st.session_state.files.get(agent)
-    if fi:
-        st.markdown(f'<div class="fbadge">✓ {fi["name"]}</div>', unsafe_allow_html=True)
-        with st.expander("Aperçu données", expanded=False):
-            if not fi["df"].empty:
-                st.dataframe(fi["df"], use_container_width=True, hide_index=True, height=140)
-    up = st.file_uploader("Importer fichier Excel", type=["xlsx"], key=f"up_{agent}", label_visibility="collapsed")
-    if up:
-        save_upload(agent, up)
-        add_msg(agent, "agent", f"✅ Fichier **{up.name}** importé. Je suis prêt à analyser tes données.")
-        st.rerun()
 
-def render_caps(agent, caps):
-    st.markdown('<div class="sec-hdr">⚙ CAPACITÉS</div>', unsafe_allow_html=True)
-    for c in caps:
-        st.markdown(f'<div class="cap-item"><span>✦</span> {c}</div>', unsafe_allow_html=True)
+def render_agent_tab(agent):
+    """Rendu complet d'un onglet agent."""
+    cfg = AGENT_CFG[agent]
+    L, R = st.columns([1, 2], gap="small")
 
-def render_quick(agent):
-    st.markdown('<div style="padding:.4rem .75rem 0;font-size:.67rem;color:var(--muted);font-family:Space Mono,monospace;letter-spacing:.08em">SUGGESTIONS RAPIDES</div>', unsafe_allow_html=True)
-    prompts = QUICK[agent]
-    cols = st.columns(min(len(prompts),3))
-    for i, p in enumerate(prompts):
-        with cols[i%3]:
-            if st.button(p, key=f"q_{agent}_{i}", use_container_width=True):
-                fp = auto_file(agent)
-                add_msg(agent, "user", p)
-                with st.spinner(f"Agent {agent} réfléchit..."):
-                    resp, excel = think(agent, p, fp)
-                add_msg(agent, "agent", resp, excel=excel)
-                st.rerun()
+    # ── PANNEAU GAUCHE ──────────────────────────────────────────────────────
+    with L:
+        # Fichier
+        st.markdown(f'<div class="sec-label">📁 FICHIER DE DONNÉES</div>', unsafe_allow_html=True)
+        fi = st.session_state.files.get(agent)
+        if fi:
+            st.markdown(f'<div class="fbadge">✓ {fi["name"]}</div>', unsafe_allow_html=True)
+            with st.expander("Aperçu", expanded=False):
+                if not fi["df"].empty:
+                    st.dataframe(fi["df"], use_container_width=True, hide_index=True, height=120)
+        up = st.file_uploader(
+            "Importer .xlsx", type=["xlsx"],
+            key=f"up_{agent}", label_visibility="collapsed"
+        )
+        if up is not None:
+            path = save_upload(agent, up)
+            if not any(m["content"].startswith("✅ Fichier") and up.name in m["content"]
+                       for m in st.session_state.chats[agent]):
+                add_msg(agent, "agent", f"✅ Fichier **{up.name}** importé ({up.size//1024} KB). Prêt à analyser.")
 
-def send_panel(agent, placeholder):
-    c1,c2 = st.columns([6,1])
-    with c1:
-        inp = st.text_input("", key=f"inp_{agent}", label_visibility="collapsed", placeholder=placeholder)
-    with c2:
-        btn = st.button("→", key=f"btn_{agent}")
-    if btn and inp:
-        fp = auto_file(agent)
-        add_msg(agent, "user", inp)
-        with st.spinner(f"Agent {agent} réfléchit..."):
-            resp, excel = think(agent, inp, fp)
-        add_msg(agent, "agent", resp, excel=excel)
-        st.rerun()
+        # Capacités
+        st.markdown(f'<div class="sec-label" style="margin-top:.75rem">⚙ CAPACITÉS</div>', unsafe_allow_html=True)
+        for cap in CAPS[agent]:
+            st.markdown(f'<div class="cap-item"><span class="cap-dot">✦</span>{cap}</div>', unsafe_allow_html=True)
+
+        # Erreurs de modules
+        if BE.get("_errors"):
+            with st.expander("⚠ Avertissements modules", expanded=False):
+                for e in BE["_errors"]:
+                    st.markdown(f'<div class="warn-box">{e}</div>', unsafe_allow_html=True)
+
+    # ── PANNEAU DROIT ───────────────────────────────────────────────────────
+    with R:
+        st.markdown(f'<div class="sec-label">{cfg["icon"]} AGENT {agent.upper()} — CHAT</div>', unsafe_allow_html=True)
+
+        # Zone chat
+        with st.container(height=360):
+            render_chat(agent)
+
+        # Suggestions rapides
+        st.markdown('<div style="padding:.3rem 0 .2rem;font-size:.67rem;color:var(--muted);font-family:Space Mono,monospace;letter-spacing:.08em">SUGGESTIONS RAPIDES</div>', unsafe_allow_html=True)
+        q_cols = st.columns(2)
+        prompts = QUICK[agent]
+        for i, prompt in enumerate(prompts):
+            with q_cols[i % 2]:
+                if st.button(prompt, key=f"q_{agent}_{i}", use_container_width=True):
+                    add_msg(agent, "user", prompt)
+                    with st.spinner(f"Agent {agent} analyse..."):
+                        resp, excel = think(agent, prompt)
+                    add_msg(agent, "agent", resp, excel=excel)
+                    st.rerun()
+
+        # Saisie libre
+        c1, c2 = st.columns([5, 1])
+        with c1:
+            user_input = st.text_input(
+                "", key=f"input_{agent}", label_visibility="collapsed",
+                placeholder=f"Pose une question à l'Agent {agent.capitalize()}..."
+            )
+        with c2:
+            st.markdown('<div class="btn-send">', unsafe_allow_html=True)
+            send = st.button("→", key=f"send_{agent}")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        if send and user_input and user_input.strip():
+            add_msg(agent, "user", user_input.strip())
+            with st.spinner(f"Agent {agent} réfléchit..."):
+                resp, excel = think(agent, user_input.strip())
+            add_msg(agent, "agent", resp, excel=excel)
+            st.rerun()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TOPBAR
 # ══════════════════════════════════════════════════════════════════════════════
-files_loaded = len(all_paths())
+n_files = len(st.session_state.files)
+file_status = f"✓ {n_files} fichier(s)" if n_files else "○ Aucun fichier"
+file_color  = "#10b981" if n_files else "#6b6b80"
+
 st.markdown(f"""
 <div class="topbar">
   <div class="topbar-logo">⬡ S&OP AGENTIQUE</div>
   <div class="topbar-sep"></div>
-  <div class="topbar-sub">5 AGENTS AUTONOMES · ANALYSE · ACTION · DÉCISION</div>
-  <div style="margin-left:auto;font-size:.72rem;font-family:'Space Mono',monospace;color:{'#10b981' if files_loaded else '#6b6b80'}">
-    {'✓ ' + str(files_loaded) + ' fichier(s) chargé(s)' if files_loaded else '○ Aucun fichier'}
-  </div>
+  <div class="topbar-sub">5 AGENTS AUTONOMES · MRP COMPLET · DÉCISION EN TEMPS RÉEL</div>
+  <div style="margin-left:auto;font-size:.72rem;font-family:'Space Mono',monospace;color:{file_color}">{file_status}</div>
 </div>
 """, unsafe_allow_html=True)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TABS
-# ══════════════════════════════════════════════════════════════════════════════
-tabs = st.tabs(["⬡ Orchestrateur","📈 Demande","🏭 Production","📣 Marketing","💰 Finance"])
+# Affiche les erreurs critiques si modules manquants
+if BE.get("_errors") and len(BE["_errors"]) > 2:
+    st.warning(f"⚠️ {len(BE['_errors'])} module(s) non chargé(s) — vérifie que tous les fichiers .py sont dans le même dossier.\n" + "\n".join(BE["_errors"][:3]))
 
-# ── TAB 0 : ORCHESTRATEUR ────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ONGLETS
+# ══════════════════════════════════════════════════════════════════════════════
+tabs = st.tabs(["⬡ Orchestrateur", "📈 Demande", "🏭 Production", "📣 Marketing", "💰 Finance"])
+
+# ── TAB ORCHESTRATEUR ────────────────────────────────────────────────────────
 with tabs[0]:
-    L, R = st.columns([1, 1.9], gap="small")
+    L, R = st.columns([1, 2], gap="small")
     with L:
-        render_file_panel("orchestrateur")
-        st.markdown('<div class="sec-hdr">⬡ TRACE DES AGENTS</div>', unsafe_allow_html=True)
-        STATUS_C = {"info":"#6b6b80","decision":"#f59e0b","start":"#3b82f6","success":"#10b981","error":"#ef4444","data":"#8b5cf6","synthesis":"#f59e0b"}
-        trace_c = st.container(height=280)
-        with trace_c:
-            for tr in st.session_state.traces[-25:]:
+        st.markdown('<div class="sec-label">📁 FICHIERS CHARGÉS</div>', unsafe_allow_html=True)
+        if st.session_state.files:
+            for ag, fi in st.session_state.files.items():
+                st.markdown(f'<div class="fbadge">{AGENT_CFG.get(ag,{}).get("icon","📄")} {fi["name"]}</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div style="color:var(--muted);font-size:.8rem">Importe des fichiers dans les onglets agents</div>', unsafe_allow_html=True)
+
+        up_orch = st.file_uploader("Importer (auto-détecté)", type=["xlsx"], key="up_orch", label_visibility="collapsed")
+        if up_orch is not None:
+            path = save_upload("orchestrateur", up_orch)
+            if "auto_load" in BE:
+                try:
+                    d = BE["auto_load"](path)
+                    if d["type"] == "production":
+                        st.session_state.files["production"] = st.session_state.files["orchestrateur"]
+                    else:
+                        for ag in ["demande","marketing","finance"]:
+                            st.session_state.files[ag] = st.session_state.files["orchestrateur"]
+                except: pass
+
+        st.markdown('<div class="sec-label" style="margin-top:.75rem">⬡ TRACE DES AGENTS</div>', unsafe_allow_html=True)
+        STATUS_C = {"info":"#6b6b80","decision":"#f59e0b","start":"#3b82f6","success":"#10b981","error":"#ef4444","synthesis":"#8b5cf6"}
+        with st.container(height=280):
+            traces = st.session_state.traces[-30:]
+            if not traces:
+                st.markdown('<div style="color:var(--muted);font-size:.8rem;padding:.5rem">Lance un scénario pour voir la trace...</div>', unsafe_allow_html=True)
+            for tr in traces:
                 c = STATUS_C.get(tr["status"],"#6b6b80")
-                ac = AGENTS.get(tr["agent"], AGENTS["orchestrateur"])
+                ac = AGENT_CFG.get(tr["agent"], AGENT_CFG["orchestrateur"])
                 st.markdown(
-                    f'<div class="trace-row"><div class="trace-dot" style="background:{c}"></div>'
+                    f'<div class="trace-item">'
+                    f'<div class="trace-dot" style="background:{c}"></div>'
                     f'<div class="trace-agent" style="color:{ac["color"]}">{ac["icon"]} {tr["agent"][:6].upper()}</div>'
                     f'<div class="trace-msg">{tr["msg"]}</div>'
-                    f'<div class="trace-time">{tr["ts"]}</div></div>', unsafe_allow_html=True)
-        if st.button("🗑 Effacer", key="clear_t"):
-            st.session_state.traces = []; st.rerun()
+                    f'<div class="trace-ts">{tr["ts"]}</div>'
+                    f'</div>', unsafe_allow_html=True)
 
-    with R:
-        st.markdown('<div class="sec-hdr">⬡ ORCHESTRATEUR — COORDINATION DES AGENTS</div>', unsafe_allow_html=True)
-        chat_c = st.container(height=390)
-        with chat_c:
-            render_msgs("orchestrateur")
-        render_quick("orchestrateur")
-        c1,c2 = st.columns([6,1])
-        with c1:
-            oi = st.text_input("", key="oi", label_visibility="collapsed",
-                               placeholder="Ex: Simule une promo -20% et dis-moi si c'est rentable")
-        with c2:
-            ob = st.button("→", key="ob")
-        if ob and oi:
-            add_msg("orchestrateur","user", oi)
-            with st.spinner("Orchestrateur en action..."):
-                resp, agents_called, _ = do_orchestrate(oi)
-            add_msg("orchestrateur","agent", resp)
+        if st.button("🗑 Effacer trace", key="clear_traces"):
+            st.session_state.traces = []
             st.rerun()
 
-# ── TAB 1 : DEMANDE ──────────────────────────────────────────────────────────
-with tabs[1]:
-    L, R = st.columns([1, 1.9], gap="small")
-    with L:
-        render_file_panel("demande")
-        render_caps("demande",["Prévision LES / Holt-Winters / ARIMA / MA","Classification auto des séries","Sélection par MAE / MAPE / RMSE","Détection anomalies & saisonnalité","Modification directe fichier Excel"])
     with R:
-        st.markdown('<div class="sec-hdr">📈 AGENT DEMANDE — PRÉVISIONS & ANALYSE</div>', unsafe_allow_html=True)
-        with st.container(height=380):
-            render_msgs("demande")
-        render_quick("demande")
-        send_panel("demande","Ex: Calcule le forecast 6 mois · Analyse la saisonnalité · Compare les méthodes")
+        st.markdown('<div class="sec-label">⬡ ORCHESTRATEUR — COORDINATION</div>', unsafe_allow_html=True)
+        with st.container(height=360):
+            render_chat("orchestrateur")
 
-# ── TAB 2 : PRODUCTION ───────────────────────────────────────────────────────
-with tabs[2]:
-    L, R = st.columns([1, 1.9], gap="small")
-    with L:
-        render_file_panel("production")
-        render_caps("production",["Analyse capacité par ressource (PHR)","Détection surcharges & alertes","Ajustement automatique plan MPS","Simulation hausse/baisse demande","Modification directe fichier Excel"])
-    with R:
-        st.markdown('<div class="sec-hdr">🏭 AGENT PRODUCTION — MPS & CAPACITÉ</div>', unsafe_allow_html=True)
-        with st.container(height=380):
-            render_msgs("production")
-        render_quick("production")
-        send_panel("production","Ex: Y a-t-il des surcharges ? · Optimise le plan · Simulation +30%")
+        st.markdown('<div style="padding:.3rem 0 .2rem;font-size:.67rem;color:var(--muted);font-family:Space Mono,monospace;letter-spacing:.08em">SUGGESTIONS RAPIDES</div>', unsafe_allow_html=True)
+        q_cols = st.columns(2)
+        for i, prompt in enumerate(QUICK["orchestrateur"]):
+            with q_cols[i%2]:
+                if st.button(prompt, key=f"q_orch_{i}", use_container_width=True):
+                    add_msg("orchestrateur", "user", prompt)
+                    with st.spinner("Orchestrateur coordonne les agents..."):
+                        resp = orchestrate(prompt)
+                    add_msg("orchestrateur", "agent", resp)
+                    st.rerun()
 
-# ── TAB 3 : MARKETING ────────────────────────────────────────────────────────
-with tabs[3]:
-    L, R = st.columns([1, 1.9], gap="small")
-    with L:
-        render_file_panel("marketing")
-        render_caps("marketing",["Simulation promotions (élasticité prix)","Calcul d'uplift par article","Analyse saisonnalité réelle","Comparaison multi-scénarios","Modification directe fichier Excel"])
-    with R:
-        st.markdown('<div class="sec-hdr">📣 AGENT MARKETING — PROMOTIONS & UPLIFT</div>', unsafe_allow_html=True)
-        with st.container(height=380):
-            render_msgs("marketing")
-        render_quick("marketing")
-        send_panel("marketing","Ex: Simule une promo -20% · Quel est le meilleur mois ? · Compare -10% vs -30%")
+        c1, c2 = st.columns([5, 1])
+        with c1:
+            orch_input = st.text_input("", key="orch_input", label_visibility="collapsed",
+                                       placeholder="Donne un ordre à l'orchestrateur...")
+        with c2:
+            st.markdown('<div class="btn-send">', unsafe_allow_html=True)
+            orch_send = st.button("→", key="orch_send")
+            st.markdown('</div>', unsafe_allow_html=True)
 
-# ── TAB 4 : FINANCE ──────────────────────────────────────────────────────────
-with tabs[4]:
-    L, R = st.columns([1, 1.9], gap="small")
-    with L:
-        render_file_panel("finance")
-        render_caps("finance",["Calcul P&L & ROI par scénario","Seuil de rentabilité automatique","Vérification budget promotion","Alertes marge & déficit","Modification directe fichier Excel"])
-    with R:
-        st.markdown('<div class="sec-hdr">💰 AGENT FINANCE — P&L & ROI</div>', unsafe_allow_html=True)
-        with st.container(height=380):
-            render_msgs("finance")
-        render_quick("finance")
-        send_panel("finance","Ex: Calcule le ROI promotion · Seuil de rentabilité · Alerte si marge < 10%")
+        if orch_send and orch_input and orch_input.strip():
+            add_msg("orchestrateur", "user", orch_input.strip())
+            with st.spinner("Orchestrateur coordonne les agents..."):
+                resp = orchestrate(orch_input.strip())
+            add_msg("orchestrateur", "agent", resp)
+            st.rerun()
+
+# ── TABS AGENTS ───────────────────────────────────────────────────────────────
+with tabs[1]: render_agent_tab("demande")
+with tabs[2]: render_agent_tab("production")
+with tabs[3]: render_agent_tab("marketing")
+with tabs[4]: render_agent_tab("finance")
