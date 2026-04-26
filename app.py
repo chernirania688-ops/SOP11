@@ -13,19 +13,46 @@ import os
 import re
 import warnings
 import tempfile
+import importlib.util
 from pathlib import Path
 from datetime import datetime
-
-# ── CRITIQUE : sys.path doit être configuré AVANT les imports de modules ──────
-APP_DIR = Path(__file__).parent.resolve()
-if str(APP_DIR) not in sys.path:
-    sys.path.insert(0, str(APP_DIR))
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 
 warnings.filterwarnings("ignore")
+
+# ── PATH ROBUSTE : fonctionne même si __file__ n'est pas défini ───────────────
+# Streamlit peut changer le cwd — on détecte le dossier de app.py de 3 façons
+def _get_app_dir() -> Path:
+    # Méthode 1 : __file__ standard
+    try:
+        return Path(__file__).parent.resolve()
+    except NameError:
+        pass
+    # Méthode 2 : depuis st.session_state s'il a été sauvegardé
+    if hasattr(st, "session_state") and "_app_dir" in st.session_state:
+        return Path(st.session_state._app_dir)
+    # Méthode 3 : cherche data_loader.py dans les dossiers probables
+    for candidate in [Path.cwd(), Path.cwd().parent, Path("/app"), Path("/mount/src")]:
+        for sub in [candidate] + list(candidate.glob("*/")):
+            if (sub / "data_loader.py").exists():
+                return sub
+    return Path.cwd()
+
+APP_DIR = _get_app_dir()
+# Sauvegarde pour les reruns
+try:
+    if "_app_dir" not in st.session_state:
+        st.session_state["_app_dir"] = str(APP_DIR)
+except: pass
+
+# Ajoute au sys.path de toutes les façons possibles
+for p in [str(APP_DIR), str(APP_DIR.parent)]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+os.chdir(str(APP_DIR))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE CONFIG
@@ -104,10 +131,14 @@ html,body,[class*="css"]{font-family:'Syne',sans-serif !important;background:var
 # IMPORT MODULES AGENTS (robuste)
 # ══════════════════════════════════════════════════════════════════════════════
 def import_modules():
-    """Importe les modules agents. Retourne un dict avec les fonctions ou erreurs."""
-    import importlib
+    """
+    Importe les modules agents depuis leur chemin absolu.
+    Utilise spec_from_file_location pour éviter les problèmes de sys.path avec Streamlit.
+    """
+    import importlib.util as ilu
+
     result = {}
-    modules = {
+    modules_cfg = {
         "data_loader":      ["auto_load", "load_demand_file", "load_production_file", "get_clean_history"],
         "agent_demande":    ["run", "analyse_article"],
         "agent_production": ["run", "analyse_capacity", "generate_adjusted_plan"],
@@ -122,15 +153,38 @@ def import_modules():
         "agent_finance":    {"run":"rf","compute_pl_scenario":"compute_pl","estimate_financials_from_history":"est_fin"},
     }
     errors = []
-    for mod_name, attrs in modules.items():
+
+    def load_module(name, path):
+        """Import un module depuis son chemin absolu."""
+        if name in sys.modules:
+            return sys.modules[name]
+        spec = ilu.spec_from_file_location(name, str(path))
+        if spec is None:
+            raise ImportError(f"Impossible de charger {path}")
+        mod = ilu.module_from_spec(spec)
+        sys.modules[name] = mod  # enregistre avant exec pour éviter imports circulaires
+        spec.loader.exec_module(mod)
+        return mod
+
+    # Ordre important : data_loader doit être chargé en premier
+    load_order = ["data_loader", "excel_writer", "agent_demande", "agent_production", "agent_marketing", "agent_finance"]
+
+    for mod_name in load_order:
+        py_file = APP_DIR / f"{mod_name}.py"
+        if not py_file.exists():
+            errors.append(f"❌ {mod_name}.py introuvable dans {APP_DIR}")
+            continue
         try:
-            mod = importlib.import_module(mod_name)
+            mod = load_module(mod_name, py_file)
+            attrs = modules_cfg.get(mod_name, [])
             for attr in attrs:
-                alias = aliases[mod_name].get(attr, attr)
+                alias = aliases.get(mod_name, {}).get(attr, attr)
                 result[alias] = getattr(mod, attr)
         except Exception as e:
             errors.append(f"❌ {mod_name} : {e}")
+
     result["_errors"] = errors
+    result["_app_dir"] = str(APP_DIR)
     return result
 
 # Import une seule fois
