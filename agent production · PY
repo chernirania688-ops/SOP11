@@ -1,275 +1,564 @@
 """
-agent_production.py — Agent Production Générique
-=================================================
-Fonctionne avec TOUT fichier MPS ayant la structure exemple_prod.xlsx.
-Détecte automatiquement les articles, ressources, indicateurs, périodes.
-Réfléchit sur la capacité, ajuste le plan et écrit dans Excel.
+agent_production.py — Agent Production MRP Complet
+====================================================
+Ce que l'agent fait RÉELLEMENT :
+  1. Lit le fichier MPS source (exemple_prod.xlsx)
+  2. Calcule TOUS les indicateurs MRP manquants :
+       - Charge de travail [PHR] = Gross × Taux
+       - Surplus capacité [PHR] = Cap - Charge
+       - Statut (OK / ALERTE / SURCHARGE)
+       - Besoins nets [U] = MAX(0, Gross - Stock + SS)
+       - Stock projeté fin période [U] (cumulatif)
+       - Planned order receipts [U]
+       - Planned order releases [U]
+       - Plan de production ajusté [U]
+  3. Écrit le fichier Excel COMPLET enrichi
 """
 
 import sys
 import warnings
 from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 import pandas as pd
 
 warnings.filterwarnings("ignore")
 sys.path.append(str(Path(__file__).parent))
-
-from data_loader import load_production_file, get_production_indicator
-from excel_writer import add_agent_watermark, save_workbook, write_dataframe_to_sheet
+from data_loader import load_production_file
 
 AGENT_NAME = "production"
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# DÉTECTION AUTOMATIQUE DES INDICATEURS
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# UTILITAIRES
+# ══════════════════════════════════════════════════════════════════════════════
 
-def find_indicator(art_dict: dict, *keywords) -> pd.Series:
-    """Cherche un indicateur par mots-clés, insensible à la casse."""
+def cn(v) -> float:
+    if v is None: return 0.0
+    if isinstance(v, (int, float)):
+        return float(v) if not (isinstance(v, float) and np.isnan(v)) else 0.0
+    if isinstance(v, str):
+        v = v.strip().replace(" ", "").replace(",", ".")
+        try: return float(v)
+        except: return 0.0
+    return 0.0
+
+
+def find_series(art_dict: dict, *keywords) -> pd.Series:
+    """Trouve une série dans le dict article par mots-clés."""
     kws = [k.lower() for k in keywords]
     for key, series in art_dict.items():
-        k_low = key.lower()
-        if all(kw in k_low for kw in kws):
+        if all(kw in key.lower() for kw in kws):
             return series
     return pd.Series(dtype=float)
 
 
-def detect_capacity(art_dict: dict) -> tuple:
+def sg(series, col, default=0.0) -> float:
+    """safe_get : lit une valeur d'une série."""
+    if isinstance(series, dict):
+        return cn(series.get(col, default))
+    if isinstance(series, pd.Series):
+        if series.empty: return default
+        try:
+            v = series.get(col, default)
+            return cn(v) if v is not None else default
+        except: return default
+    return default
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CALCUL MRP COMPLET PAR ARTICLE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_mrp(art_id: str, art_dict: dict, time_cols: list, context: dict) -> dict:
     """
-    Détecte automatiquement : capacité disponible, taux de charge, ressource.
-    Retourne (capacity_series, var_req_series, resource_name).
+    Calcule tous les indicateurs MRP pour un article, période par période.
+    Logique réelle d'un système MRP/ERP.
     """
-    cap_series = find_indicator(art_dict, "available", "capacity")
-    var_series = find_indicator(art_dict, "variable", "requirement")
+    # Extraction données source
+    gross    = find_series(art_dict, "gross", "requirement")
+    var_req  = find_series(art_dict, "variable", "requirement")
+    cap      = find_series(art_dict, "available", "capacity")
+    init_inv = find_series(art_dict, "initial", "inventory")
+    safety   = find_series(art_dict, "safety", "stock")
+    batch    = find_series(art_dict, "batch", "size")
+    min_plan = find_series(art_dict, "minimum", "production")
+    prod_plan= find_series(art_dict, "production", "plan")
+    frozen   = find_series(art_dict, "frozen")
 
-    if cap_series.empty:
-        # Fallback : cherche n'importe quel indicateur contenant "capacity"
-        for key, s in art_dict.items():
-            if "capacity" in key.lower():
-                cap_series = s
-                break
-
-    if var_series.empty:
-        for key, s in art_dict.items():
-            if "variable" in key.lower() or ("requirement" in key.lower() and "gross" not in key.lower()):
-                var_series = s
-                break
-
-    resource = "Ressource"
+    # Détection ressource
+    resource = "PHR"
     for key in art_dict.keys():
-        if "capacity" in key.lower() or "requirement" in key.lower():
-            parts = key.split("[")
-            if len(parts) > 1:
-                resource = parts[-1].replace("]", "").strip()
+        if "capacity" in key.lower() and "[" in key:
+            resource = key.split("[")[-1].replace("]","").strip()
             break
 
-    return cap_series, var_series, resource
+    # Valeurs par défaut
+    cap_def = float(cap.dropna().median()) if not cap.empty and len(cap.dropna())>0 else 1400.0
+    var_def = float(var_req.dropna().median()) if not var_req.empty and len(var_req.dropna())>0 else 0.4667
+    ss_def  = float(safety.dropna().median()) if not safety.empty and len(safety.dropna())>0 else 0.0
+    bat_def = float(batch.dropna().median()) if not batch.empty and len(batch.dropna())>0 else 1.0
 
+    # Stock initial
+    inv = sg(init_inv, time_cols[0], 0.0)
+    demand_boost = context.get("demand_boost", 1.0)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ANALYSE CAPACITÉ
-# ═══════════════════════════════════════════════════════════════════════════
+    # Résultats calculés
+    R = {
+        "resource":   resource,
+        "article":    art_id,
+        "time_cols":  time_cols,
+        "source":     art_dict,  # conserve la source
+        "workload":   {},
+        "surplus":    {},
+        "status":     {},
+        "net_req":    {},
+        "proj_inv":   {},
+        "ord_receipt":{},
+        "ord_release":{},
+        "plan_ajuste":{},
+        "action":     {},
+    }
 
-def analyse_capacity(article_id: str, art_dict: dict, time_cols: list, context: dict) -> pd.DataFrame:
-    """
-    L'agent réfléchit :
-    1. Lit les besoins bruts
-    2. Calcule la charge = besoin × taux
-    3. Compare à la capacité disponible
-    4. Catégorise chaque période
-    """
-    gross    = find_indicator(art_dict, "gross", "requirement")
-    cap_s, var_s, resource = detect_capacity(art_dict)
-    safety   = find_indicator(art_dict, "safety", "stock")
-    min_prod = find_indicator(art_dict, "minimum", "production")
-    plan     = find_indicator(art_dict, "production", "plan")
-
-    # Capacité et taux : utilise la valeur médiane si variable
-    cap_default = float(cap_s.dropna().median()) if not cap_s.empty and cap_s.dropna().shape[0] > 0 else None
-    var_default = float(var_s.dropna().median()) if not var_s.empty and var_s.dropna().shape[0] > 0 else None
-
-    rows = []
     for w in time_cols:
-        g = float(gross.get(w, 0) or 0) if not gross.empty else 0
-        c = float(cap_s.get(w, cap_default) or cap_default or 0) if not cap_s.empty else (cap_default or 0)
-        v = float(var_s.get(w, var_default) or var_default or 0) if not var_s.empty else (var_default or 0)
-        ss = float(safety.get(w, 0) or 0) if not safety.empty else 0
-        mp = float(min_prod.get(w, 0) or 0) if not min_prod.empty else 0
-        pp = float(plan.get(w, 0) or 0) if not plan.empty else 0
+        g   = sg(gross,    w) * demand_boost
+        v   = sg(var_req,  w) or var_def
+        c   = sg(cap,      w) or cap_def
+        ss  = sg(safety,   w) or ss_def
+        bat = sg(batch,    w) or bat_def
+        pp  = sg(prod_plan, w)
+        frz = sg(frozen,   w)
+        mp  = sg(min_plan, w)
 
-        charge = g * v if v > 0 else g
-        surplus = c - charge if c > 0 else None
+        # 1. Charge [PHR]
+        wl = round(g * v, 2)
+        R["workload"][w] = wl
 
-        if c <= 0:
-            status = "⚪ Capacité inconnue"
-        elif surplus is not None and surplus < 0:
-            status = "🔴 SURCHARGE"
-        elif surplus is not None and surplus < c * 0.15:
-            status = "🟡 ALERTE (< 15% dispo)"
+        # 2. Surplus [PHR]
+        surp = round(c - wl, 2)
+        R["surplus"][w] = surp
+
+        # 3. Statut
+        if c <= 0:      st = "⚪ INCONNU"
+        elif surp < 0:  st = "🔴 SURCHARGE"
+        elif surp < c * 0.15: st = "🟡 ALERTE"
+        else:           st = "🟢 OK"
+        R["status"][w] = st
+
+        # 4. Besoins nets
+        net = max(0.0, g - inv + ss)
+        R["net_req"][w] = round(net, 2)
+
+        # 5. Planned orders (arrondi au batch, minimum plan)
+        if net > 0:
+            po = max(bat * np.ceil(net / bat), mp)
         else:
-            status = "🟢 OK"
+            po = 0.0
+        R["ord_receipt"][w] = round(po, 2)
+        R["ord_release"][w] = round(po, 2)
 
-        rows.append({
-            "Période":          w,
-            "Article":          article_id,
-            "Ressource":        resource,
-            "Besoin brut [U]":  round(g, 0),
-            f"Charge [{resource}]": round(charge, 1) if v > 0 else "N/A",
-            f"Capacité [{resource}]": round(c, 1) if c > 0 else "N/A",
-            "Surplus":          round(surplus, 1) if surplus is not None else "N/A",
-            "Safety stock [U]": round(ss, 1),
-            "Plan prod [U]":    round(pp, 0),
-            "Statut":           status,
-        })
+        # 6. Stock projeté fin de période
+        inv_end = round(inv + pp - g, 2)
+        R["proj_inv"][w] = inv_end
 
-    return pd.DataFrame(rows)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# AJUSTEMENT AUTOMATIQUE DU PLAN
-# ═══════════════════════════════════════════════════════════════════════════
-
-def generate_adjusted_plan(df: pd.DataFrame, art_dict: dict) -> pd.DataFrame:
-    """
-    L'agent agit comme un planificateur :
-    - Si surcharge → réduit au max possible
-    - Si alerte → recommande surveillance
-    - Si OK → maintient le plan
-    - Propose le report de production si pic détecté
-    """
-    df = df.copy()
-    cap_s, var_s, resource = detect_capacity(art_dict)
-    var_default = float(var_s.dropna().median()) if not var_s.empty and var_s.dropna().shape[0] > 0 else None
-
-    adjustments = []
-    for i, row in df.iterrows():
-        statut = row["Statut"]
-        g      = row["Besoin brut [U]"]
-        c_val  = row.get(f"Capacité [{resource}]", None)
-        v_val  = var_default
-
-        if statut == "🔴 SURCHARGE" and c_val and c_val != "N/A" and v_val and v_val > 0:
-            max_u = float(c_val) / v_val
-            action = f"Réduit {g:.0f}→{max_u:.0f} U (cap. max)"
-            adjustments.append({"Période": row["Période"], "Plan ajusté [U]": round(max_u, 0), "Action": action})
-        elif statut == "🟡 ALERTE (< 15% dispo)":
-            action = "Surveillance requise — faible marge capacité"
-            adjustments.append({"Période": row["Période"], "Plan ajusté [U]": g, "Action": action})
+        # 7. Plan ajusté
+        if "SURCHARGE" in st and frz == 0 and v > 0:
+            max_u = round(c / v, 0)
+            R["plan_ajuste"][w] = max_u
+            R["action"][w] = f"Réduit {g:.0f}→{max_u:.0f} U (max cap. {c:.0f} {resource})"
+        elif "ALERTE" in st:
+            R["plan_ajuste"][w] = pp
+            R["action"][w] = "Surveillance — marge capacité < 15%"
+        elif "SURCHARGE" in st and frz == 1:
+            R["plan_ajuste"][w] = pp
+            R["action"][w] = "Figé (frozen=1) — surcharge non corrigeable"
         else:
-            adjustments.append({"Période": row["Période"], "Plan ajusté [U]": g, "Action": "Plan maintenu"})
+            R["plan_ajuste"][w] = pp
+            R["action"][w] = "Plan maintenu ✓"
 
-    df_adj = pd.DataFrame(adjustments)
-    return df.merge(df_adj, on="Période", how="left")
+        inv = inv_end
+
+    return R
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ÉCRITURE EXCEL
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# STYLES EXCEL
+# ══════════════════════════════════════════════════════════════════════════════
 
-def write_output(analyses: dict, output_path: str):
+def _bd(style="thin", color="CCCCCC"):
+    return Side(style=style, color=color)
+
+BT = Border(left=_bd(), right=_bd(), top=_bd(), bottom=_bd())
+BM = Border(left=_bd("medium","999999"), right=_bd("medium","999999"),
+            top=_bd("medium","999999"),  bottom=_bd("medium","999999"))
+
+def fc(cell, v, bg="FFFFFF", fg="000000", bold=False, size=9,
+       fmt=None, ha="center", wrap=False, italic=False):
+    cell.value = v
+    cell.font  = Font(color=fg, bold=bold, size=size, name="Arial", italic=italic)
+    cell.fill  = PatternFill("solid", fgColor=bg)
+    cell.alignment = Alignment(horizontal=ha, vertical="center", wrap_text=wrap)
+    cell.border = BT
+    if fmt: cell.number_format = fmt
+
+def hdr(cell, v, bg="1A1A2E", fg="FFFFFF", size=9, bold=True):
+    fc(cell, v, bg=bg, fg=fg, bold=bold, size=size)
+    cell.border = BM
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ÉCRITURE EXCEL COMPLET
+# ══════════════════════════════════════════════════════════════════════════════
+
+def write_excel(mrp_results: dict, output_path: str):
     wb = openpyxl.Workbook()
-    ws1 = wb.active
-    ws1.title = "Analyse Capacité"
-    ws1.merge_cells("A1:K1")
-    ws1["A1"] = "AGENT PRODUCTION — ANALYSE CAPACITÉ & PLAN AJUSTÉ"
-    ws1["A1"].font  = openpyxl.styles.Font(bold=True, size=13, name="Calibri", color="412402")
-    ws1["A1"].fill  = openpyxl.styles.PatternFill("solid", fgColor="FAEEDA")
-    ws1["A1"].alignment = openpyxl.styles.Alignment(horizontal="center", vertical="center")
-    ws1.row_dimensions[1].height = 32
+    first = True
 
-    all_rows = []
-    for art_id, (df_cap, df_adj) in analyses.items():
-        all_rows.append(df_adj)
-    if all_rows:
-        df_all = pd.concat(all_rows, ignore_index=True)
-        write_dataframe_to_sheet(ws1, df_all, AGENT_NAME, start_row=3)
-    add_agent_watermark(ws1, AGENT_NAME, "Analyse automatique capacité. Ajustements si surcharge détectée.")
+    for art_id, R in mrp_results.items():
+        tc  = R["time_cols"]
+        res = R["resource"]
+        nc  = len(tc)
+        lc  = get_column_letter(3 + nc)
 
-    # Feuille résumé surcharges
-    ws2 = wb.create_sheet("Alertes & Surcharges")
-    ws2["A1"] = "ALERTES DÉTECTÉES"
-    ws2["A1"].font = openpyxl.styles.Font(bold=True, size=13, name="Calibri")
-    all_alerts = []
-    for art_id, (df_cap, df_adj) in analyses.items():
-        alerts = df_adj[df_adj["Statut"].isin(["🔴 SURCHARGE", "🟡 ALERTE (< 15% dispo)"])]
-        all_alerts.append(alerts)
-    if all_alerts:
-        df_alerts = pd.concat(all_alerts, ignore_index=True)
-        if not df_alerts.empty:
-            write_dataframe_to_sheet(ws2, df_alerts, AGENT_NAME, start_row=3)
-        else:
-            ws2["A3"] = "✅ Aucune surcharge détectée"
-    add_agent_watermark(ws2, AGENT_NAME, "Périodes nécessitant une action de planification.")
+        # ── Feuille MPS Complet ───────────────────────────────────────────────
+        ws = wb.active if first else wb.create_sheet(f"MPS {art_id}"[:31])
+        ws.title = f"MPS {art_id}"[:31]
+        first = False
 
-    save_workbook(wb, output_path)
+        # Titre
+        ws.merge_cells(f"A1:{lc}1")
+        ws["A1"] = f"AGENT PRODUCTION — MPS/MRP COMPLET — Article {art_id} — {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+        ws["A1"].font  = Font(bold=True, size=11, color="FFFFFF", name="Arial")
+        ws["A1"].fill  = PatternFill("solid", fgColor="1A1A2E")
+        ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[1].height = 26
+
+        # En-têtes colonnes
+        hdr(ws.cell(2,1), "Article",    "2C3E50")
+        hdr(ws.cell(2,2), "Indicateur", "2C3E50")
+        hdr(ws.cell(2,3), "Ressource",  "2C3E50")
+        for i, w in enumerate(tc, 4):
+            hdr(ws.cell(2, i), str(w).replace(" Y23","").replace(" Y2023",""), "2C3E50", size=8)
+        ws.row_dimensions[2].height = 26
+
+        ws.column_dimensions["A"].width = 8
+        ws.column_dimensions["B"].width = 36
+        ws.column_dimensions["C"].width = 10
+        for i in range(4, 4+nc):
+            ws.column_dimensions[get_column_letter(i)].width = 10
+
+        src = R["source"]
+
+        # Définition complète des lignes
+        ROWS = [
+            # label, resource, data_key_or_series, fg, bg, bold, fmt, section
+            ("── DONNÉES D'ENTRÉE (source ERP) ──",  "",  None,                     "FFFFFF","1A1A2E",True, None,     "sep"),
+            ("Gross requirements [U]",               "",  find_series(src,"gross","requirement"),    "1565C0","EBF5FB",False,'#,##0',   "inp"),
+            ("Variable requirement [PHR/U]",         res, find_series(src,"variable","requirement"), "1565C0","EBF5FB",False,'0.0000',  "inp"),
+            ("Available capacity [PHR]",             res, find_series(src,"available","capacity"),   "1565C0","EBF5FB",False,'#,##0',   "inp"),
+            ("Initial inventory [U]",                "",  find_series(src,"initial","inventory"),    "1565C0","EBF5FB",False,'#,##0',   "inp"),
+            ("Safety stock [U]",                     "",  find_series(src,"safety","stock"),         "1565C0","EBF5FB",False,'#,##0.00',"inp"),
+            ("Batch size [U]",                       "",  find_series(src,"batch","size"),           "1565C0","EBF5FB",False,'#,##0',   "inp"),
+            ("Minimum production plan [U]",          "",  find_series(src,"minimum","production"),   "1565C0","EBF5FB",False,'#,##0',   "inp"),
+            ("Minimum run [U]",                      "",  find_series(src,"minimum","run"),          "1565C0","EBF5FB",False,'#,##0',   "inp"),
+            ("Maximum inventory [U]",                "",  find_series(src,"maximum","inventory"),    "1565C0","EBF5FB",False,'#,##0',   "inp"),
+            ("Maximum production [U]",               "",  find_series(src,"maximum","production"),   "1565C0","EBF5FB",False,'#,##0',   "inp"),
+            ("Frozen production",                    "",  find_series(src,"frozen"),                 "1565C0","EBF5FB",False,'0',        "inp"),
+            ("Production plan [U]",                  "",  find_series(src,"production","plan"),      "1565C0","D6EAF8",True, '#,##0',   "plan_src"),
+            ("── CALCULS MRP (Agent Production) ──", "",  None,                     "FFFFFF","0F3460",True, None,     "sep"),
+            ("Charge de travail [PHR]",              res, R["workload"],             "000000","F8F9FA",False,'#,##0.0', "calc"),
+            ("Surplus capacité [PHR]",               res, R["surplus"],              "000000","F8F9FA",False,'#,##0.0', "surplus"),
+            ("Statut capacité",                      "",  R["status"],               "000000","F8F9FA",False,None,       "status"),
+            ("Besoins nets [U]",                     "",  R["net_req"],              "000000","F8F9FA",False,'#,##0',   "calc"),
+            ("Stock projeté fin période [U]",        "",  R["proj_inv"],             "000000","F8F9FA",False,'#,##0',   "inv"),
+            ("Planned order receipts [U]",           "",  R["ord_receipt"],          "000000","F8F9FA",False,'#,##0',   "calc"),
+            ("Planned order releases [U]",           "",  R["ord_release"],          "000000","F8F9FA",False,'#,##0',   "calc"),
+            ("── PLAN AJUSTÉ (Agent Production) ──", "",  None,                     "FFFFFF","145A32",True, None,     "sep"),
+            ("Plan de production ajusté [U]",        "",  R["plan_ajuste"],          "FFFFFF","1E8449",True, '#,##0',  "adjusted"),
+            ("Action recommandée",                   "",  R["action"],               "6C3483","FEF9E7",False,None,      "action"),
+        ]
+
+        art_written = False
+        for r_idx, (lbl, res_lbl, data, fg, bg, bold, fmt, sec) in enumerate(ROWS, 3):
+            ws.row_dimensions[r_idx].height = 16 if sec == "sep" else 20
+
+            if sec == "sep":
+                ws.merge_cells(f"A{r_idx}:{lc}{r_idx}")
+                c = ws.cell(r_idx, 1)
+                c.value = lbl; c.font = Font(bold=True, color=fg, size=9, name="Arial")
+                c.fill = PatternFill("solid", fgColor=bg)
+                c.alignment = Alignment(horizontal="center", vertical="center")
+                continue
+
+            # Col A
+            ac = ws.cell(r_idx, 1)
+            if not art_written and sec == "inp":
+                ac.value = art_id
+                ac.font = Font(bold=True, size=9, name="Arial")
+                ac.alignment = Alignment(horizontal="center", vertical="center")
+                art_written = True
+            ac.border = BT
+
+            # Col B
+            bc = ws.cell(r_idx, 2)
+            fc(bc, lbl, bg=bg, fg=fg, bold=bold, ha="left")
+
+            # Col C
+            fc(ws.cell(r_idx, 3), res_lbl or "", bg=bg, fg="888888", size=8)
+
+            # Colonnes données
+            for i, w in enumerate(tc, 4):
+                c = ws.cell(r_idx, i)
+                val = sg(data, w) if isinstance(data, (dict, pd.Series)) else None
+
+                if sec == "status":
+                    sv = data.get(w, "🟢 OK") if isinstance(data, dict) else "🟢 OK"
+                    if "SURCHARGE" in str(sv): fc(c, sv, bg="FFCDD2", fg="B71C1C", bold=True)
+                    elif "ALERTE"  in str(sv): fc(c, sv, bg="FFF9C4", fg="E65100", bold=True)
+                    elif "INCONNU" in str(sv): fc(c, sv, bg="ECEFF1", fg="607D8B")
+                    else:                       fc(c, sv, bg="C8E6C9", fg="1B5E20", bold=True)
+
+                elif sec == "surplus":
+                    fv = val or 0.0
+                    if   fv < 0:   fc(c, fv, bg="FFCDD2", fg="B71C1C", bold=True, fmt=fmt)
+                    elif fv < 200: fc(c, fv, bg="FFF9C4", fg="E65100", fmt=fmt)
+                    else:          fc(c, fv, bg="F1F8E9", fg="2E7D32", fmt=fmt)
+
+                elif sec == "inv":
+                    fv = val or 0.0
+                    if fv < 0: fc(c, fv, bg="FFCDD2", fg="B71C1C", bold=True, fmt=fmt)
+                    else:      fc(c, fv, bg="F8F9FA", fg="000000", fmt=fmt)
+
+                elif sec == "adjusted":
+                    fc(c, val or 0.0, bg="1E8449", fg="FFFFFF", bold=True, fmt=fmt)
+
+                elif sec == "action":
+                    sv = data.get(w, "") if isinstance(data, dict) else ""
+                    if "Réduit"    in str(sv): fc(c, sv, bg="FDEDEC", fg="922B21", wrap=True)
+                    elif "Surveill" in str(sv): fc(c, sv, bg="FEF9E7", fg="784212", wrap=True)
+                    elif "Figé"    in str(sv): fc(c, sv, bg="F2F3F4", fg="616A6B", italic=True, wrap=True)
+                    else:                       fc(c, sv, bg="EAFAF1", fg="1E8449", wrap=True)
+
+                elif sec == "plan_src":
+                    fc(c, val or 0.0, bg="D6EAF8", fg="1565C0", bold=True, fmt=fmt)
+
+                else:
+                    fc(c, val, bg=bg, fg=fg, bold=bold, fmt=fmt)
+
+        ws.freeze_panes = "D3"
+
+        # ── Feuille Plan Ajusté ───────────────────────────────────────────────
+        ws2 = wb.create_sheet(f"Plan Ajusté"[:31])
+        lc2 = get_column_letter(1 + nc)
+        ws2.merge_cells(f"A1:{lc2}1")
+        ws2["A1"] = f"PLAN DE PRODUCTION AJUSTÉ — {art_id}"
+        ws2["A1"].font = Font(bold=True, size=11, color="FFFFFF", name="Arial")
+        ws2["A1"].fill = PatternFill("solid", fgColor="1E8449")
+        ws2["A1"].alignment = Alignment(horizontal="center", vertical="center")
+        ws2.row_dimensions[1].height = 26
+        ws2.column_dimensions["A"].width = 34
+        for i in range(2, 2+nc):
+            ws2.column_dimensions[get_column_letter(i)].width = 10
+
+        hdr(ws2.cell(2, 1), "Indicateur", "2C3E50")
+        for i, w in enumerate(tc, 2):
+            hdr(ws2.cell(2, i), str(w).replace(" Y23",""), "2C3E50", size=8)
+
+        plan_rows = [
+            ("Gross requirements [U]",       find_series(src,"gross","requirement"),  '#,##0',   "EBF5FB","1565C0"),
+            ("Production plan original [U]", find_series(src,"production","plan"),    '#,##0',   "D6EAF8","1565C0"),
+            ("► Plan ajusté Agent [U]",      R["plan_ajuste"],                        '#,##0',   "D5F5E3","1E8449"),
+            ("Charge travail [PHR]",         R["workload"],                           '#,##0.0', "F8F9FA","000000"),
+            ("Capacité disponible [PHR]",    find_series(src,"available","capacity"), '#,##0',   "F8F9FA","000000"),
+            ("Surplus capacité [PHR]",       R["surplus"],                            '#,##0.0', "F8F9FA","000000"),
+            ("Besoins nets [U]",             R["net_req"],                            '#,##0',   "F8F9FA","000000"),
+            ("► Stock projeté fin période [U]", R["proj_inv"],                       '#,##0',   "F8F9FA","000000"),
+            ("Planned order receipts [U]",   R["ord_receipt"],                        '#,##0',   "F8F9FA","000000"),
+            ("Statut capacité",              R["status"],                             None,      "F8F9FA","000000"),
+            ("Action recommandée",           R["action"],                             None,      "FEF9E7","784212"),
+        ]
+
+        for r, (lbl, data, fmt, bg, fg) in enumerate(plan_rows, 3):
+            ws2.row_dimensions[r].height = 20
+            lc2_cell = ws2.cell(r, 1)
+            bold = "►" in lbl
+            fc(lc2_cell, lbl, bg=bg, fg=fg, bold=bold, ha="left")
+
+            for i, w in enumerate(tc, 2):
+                c = ws2.cell(r, i)
+                val = sg(data, w) if isinstance(data, (dict, pd.Series)) else None
+
+                if lbl == "Statut capacité":
+                    sv = data.get(w,"🟢 OK") if isinstance(data,dict) else "🟢 OK"
+                    if "SURCHARGE" in str(sv): fc(c, sv, bg="FFCDD2", fg="B71C1C", bold=True)
+                    elif "ALERTE" in str(sv):  fc(c, sv, bg="FFF9C4", fg="E65100", bold=True)
+                    else:                       fc(c, sv, bg="C8E6C9", fg="1B5E20", bold=True)
+                elif lbl == "Surplus capacité [PHR]":
+                    fv = val or 0.0
+                    if fv<0:    fc(c, fv, bg="FFCDD2", fg="B71C1C", bold=True, fmt=fmt)
+                    elif fv<200:fc(c, fv, bg="FFF9C4", fg="E65100", fmt=fmt)
+                    else:       fc(c, fv, bg="F1F8E9", fg="2E7D32", fmt=fmt)
+                elif "Stock projeté" in lbl:
+                    fv = val or 0.0
+                    fc(c, fv, bg="FFCDD2" if fv<0 else bg, fg="B71C1C" if fv<0 else fg, bold=(fv<0), fmt=fmt)
+                elif "Plan ajusté" in lbl:
+                    fc(c, val or 0.0, bg="D5F5E3", fg="1E8449", bold=True, fmt=fmt)
+                elif lbl == "Action recommandée":
+                    sv = data.get(w,"") if isinstance(data,dict) else ""
+                    if "Réduit" in str(sv): fc(c, sv, bg="FDEDEC", fg="922B21", wrap=True)
+                    elif "Surveill" in str(sv): fc(c, sv, bg="FEF9E7", fg="784212", wrap=True)
+                    else: fc(c, sv, bg="EAFAF1", fg="1E8449", wrap=True)
+                else:
+                    fc(c, val, bg=bg, fg=fg, fmt=fmt)
+
+        ws2.freeze_panes = "B3"
+
+    # ── Feuille Alertes ───────────────────────────────────────────────────────
+    ws3 = wb.create_sheet("⚠ Alertes & Surcharges")
+    ws3.merge_cells("A1:F1")
+    ws3["A1"] = "PÉRIODES EN SURCHARGE OU ALERTE — ACTION REQUISE"
+    ws3["A1"].font = Font(bold=True, size=11, color="FFFFFF", name="Arial")
+    ws3["A1"].fill = PatternFill("solid", fgColor="C0392B")
+    ws3["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws3.row_dimensions[1].height = 26
+    for i, h in enumerate(["Article","Période","Statut","Surplus [PHR]","Stock projeté [U]","Action"], 1):
+        hdr(ws3.cell(2, i), h, "2C3E50")
+    for w, wd in zip(range(1,7), [12,12,14,16,20,45]):
+        ws3.column_dimensions[get_column_letter(w)].width = wd
+
+    ar = 3; found = False
+    for art_id, R in mrp_results.items():
+        for w in R["time_cols"]:
+            st = R["status"].get(w, "")
+            if "SURCHARGE" in str(st) or "ALERTE" in str(st):
+                found = True
+                bg = "FFCDD2" if "SURCHARGE" in str(st) else "FFF9C4"
+                fg = "B71C1C" if "SURCHARGE" in str(st) else "E65100"
+                for ci, val in enumerate([art_id, w, st,
+                                           R["surplus"].get(w,0),
+                                           R["proj_inv"].get(w,0),
+                                           R["action"].get(w,"")], 1):
+                    fmt = '#,##0.0' if ci in [4,5] else None
+                    fc(ws3.cell(ar, ci), val, bg=bg, fg=fg, bold=(ci==3), fmt=fmt, wrap=(ci==6))
+                ws3.row_dimensions[ar].height = 20
+                ar += 1
+    if not found:
+        ws3.merge_cells("A3:F3")
+        ws3["A3"] = "✅ Aucune surcharge ni alerte — capacité suffisante sur tout l'horizon"
+        ws3["A3"].font = Font(bold=True, color="1E8449", size=10, name="Arial")
+        ws3["A3"].fill = PatternFill("solid", fgColor="C8E6C9")
+        ws3["A3"].alignment = Alignment(horizontal="center", vertical="center")
+
+    # Watermark sur toutes les feuilles
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    for sh in wb.sheetnames:
+        wsh = wb[sh]
+        lr = wsh.max_row + 2
+        wsh.cell(lr, 1, f"[Agent PRODUCTION — {ts}] Calculs : Charge=Gross×Taux | Surplus=Cap-Charge | Net=MAX(0,G-Inv+SS) | ProjInv=Inv+Plan-G")
+        wsh.cell(lr, 1).font = Font(italic=True, color="AAAAAA", size=8, name="Arial")
+
+    wb.save(output_path)
+    print(f"  ✅ Fichier complet : {output_path}")
     return output_path
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 # POINT D'ENTRÉE
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+
+def analyse_capacity(article_id, art_dict, time_cols, context):
+    """Compatibilité avec app.py — retourne un DataFrame."""
+    R = compute_mrp(article_id, art_dict, time_cols, context)
+    rows = []
+    res = R["resource"]
+    for w in time_cols:
+        rows.append({
+            "Période": w, "Article": article_id, "Ressource": res,
+            "Besoin brut [U]": sg(find_series(art_dict,"gross","requirement"), w),
+            f"Charge [{res}]": R["workload"].get(w, 0),
+            f"Capacité [{res}]": sg(find_series(art_dict,"available","capacity"), w),
+            "Surplus": R["surplus"].get(w, 0),
+            "Safety stock [U]": sg(find_series(art_dict,"safety","stock"), w),
+            "Plan prod [U]": sg(find_series(art_dict,"production","plan"), w),
+            "Statut": R["status"].get(w, ""),
+        })
+    return pd.DataFrame(rows)
+
+
+def generate_adjusted_plan(df: pd.DataFrame, art_dict: dict) -> pd.DataFrame:
+    """Compatibilité avec app.py."""
+    df = df.copy()
+    var_s = find_series(art_dict, "variable","requirement")
+    var_def = float(var_s.dropna().median()) if not var_s.empty else 0.4667
+    res = df.columns[4].replace("Charge [","").replace("]","") if len(df.columns)>4 else "PHR"
+    actions = []
+    for _, row in df.iterrows():
+        st = row.get("Statut","")
+        g  = row.get("Besoin brut [U]", 0)
+        c  = row.get(f"Capacité [{res}]", 0) if f"Capacité [{res}]" in row.index else 0
+        if "SURCHARGE" in str(st) and c > 0 and var_def > 0:
+            max_u = round(c / var_def, 0)
+            actions.append({"Période": row["Période"], "Plan ajusté [U]": max_u, "Action": f"Réduit {g:.0f}→{max_u:.0f} U"})
+        else:
+            actions.append({"Période": row["Période"], "Plan ajusté [U]": g, "Action": "Plan maintenu"})
+    return df.merge(pd.DataFrame(actions), on="Période", how="left")
+
 
 def run(context: dict = None) -> dict:
     ctx = context or {}
     print("\n" + "="*60)
-    print("🤖 AGENT PRODUCTION — DÉMARRAGE")
+    print("🤖 AGENT PRODUCTION — CALCUL MRP COMPLET")
     print("="*60)
-    if ctx:
-        print(f"  📩 Contexte : {ctx}")
 
-    # Fichier
     prod_file = ctx.get("prod_file")
     if not prod_file:
         candidates = list(Path(".").glob("*.xlsx"))
         prod_file = next(
-            (str(f) for f in candidates if "prod" in f.name.lower() or "mps" in f.name.lower() or "exemple" in f.name.lower()),
+            (str(f) for f in candidates if any(k in f.name.lower() for k in ["prod","mps","exemple"]) and "output" not in f.name.lower()),
             str(candidates[0]) if candidates else None
         )
-
     if not prod_file or not Path(prod_file).exists():
-        return {"agent": "production", "status": "error", "error": "Aucun fichier production trouvé"}
+        return {"agent":"production","status":"error","error":"Aucun fichier production trouvé"}
 
-    print(f"  📂 Chargement : {Path(prod_file).name}")
+    print(f"  📂 Source : {Path(prod_file).name}")
     data = load_production_file(prod_file)
 
-    analyses = {}
-    total_surcharges = []
-    total_alertes    = []
+    mrp_results = {}
+    total_surcharges, total_alertes = [], []
 
     for art_id, art_dict in data["articles"].items():
-        print(f"\n  🏭 Article : {art_id}")
-        df_cap = analyse_capacity(art_id, art_dict, data["time_cols"], ctx)
-        df_adj = generate_adjusted_plan(df_cap, art_dict)
-        analyses[art_id] = (df_cap, df_adj)
+        print(f"\n  🏭 Article {art_id} — {len(data['time_cols'])} périodes")
+        R = compute_mrp(art_id, art_dict, data["time_cols"], ctx)
+        mrp_results[art_id] = R
 
-        surcharges = df_adj[df_adj["Statut"] == "🔴 SURCHARGE"]["Période"].tolist()
-        alertes    = df_adj[df_adj["Statut"] == "🟡 ALERTE (< 15% dispo)"]["Période"].tolist()
+        surcharges = [w for w,s in R["status"].items() if "SURCHARGE" in str(s)]
+        alertes    = [w for w,s in R["status"].items() if "ALERTE"    in str(s)]
         total_surcharges.extend(surcharges)
         total_alertes.extend(alertes)
-        print(f"    Surcharges : {len(surcharges)} | Alertes : {len(alertes)}")
+        print(f"    🔴 {len(surcharges)} surcharge(s) | 🟡 {len(alertes)} alerte(s)")
 
-    output_path = ctx.get("output_path", str(Path(prod_file).parent / "output_agent_production.xlsx"))
-    write_output(analyses, output_path)
+    output_path = ctx.get("output_path",
+                          str(Path(prod_file).parent / "output_agent_production_complet.xlsx"))
+    write_excel(mrp_results, output_path)
 
-    summary = {
-        "agent":               "production",
-        "status":              "success",
-        "articles_analysed":   len(analyses),
-        "periodes_analysees":  len(data["time_cols"]),
+    return {
+        "agent": "production", "status": "success",
+        "fichier_source": Path(prod_file).name,
+        "articles_analysed": len(mrp_results),
+        "periodes_analysees": len(data["time_cols"]),
         "surcharges_detectees": len(total_surcharges),
-        "alertes_detectees":   len(total_alertes),
-        "periodes_surcharge":  total_surcharges,
-        "periodes_alerte":     total_alertes,
-        "output_file":         output_path,
-        "capacity_ok":         len(total_surcharges) == 0,
+        "alertes_detectees": len(total_alertes),
+        "periodes_surcharge": total_surcharges,
+        "periodes_alerte": total_alertes,
+        "capacity_ok": len(total_surcharges) == 0,
+        "output_file": output_path,
+        "calculs_ajoutes": ["Charge [PHR]","Surplus [PHR]","Statut","Besoins nets [U]",
+                            "Stock projeté [U]","Planned order receipts","Planned order releases","Plan ajusté"],
     }
-
-    print(f"\n✅ Agent Production — surcharges={len(total_surcharges)} | alertes={len(total_alertes)}")
-    print("="*60 + "\n")
-    return summary
 
 
 if __name__ == "__main__":
@@ -278,7 +567,6 @@ if __name__ == "__main__":
     p.add_argument("--file", default=None)
     args = p.parse_args()
     result = run({"prod_file": args.file})
-    print("\n📋 RÉSUMÉ :")
     for k, v in result.items():
-        if k != "output_file":
+        if k not in ("output_file","periodes_surcharge","periodes_alerte","calculs_ajoutes"):
             print(f"  {k}: {v}")
