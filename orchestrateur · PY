@@ -1,0 +1,308 @@
+"""
+orchestrateur.py — Orchestrateur S&OP Générique
+================================================
+Reçoit un scénario + des fichiers uploadés,
+détecte automatiquement leur type (demande / production),
+route les bons fichiers aux bons agents,
+synthétise et prend une décision.
+"""
+
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import openpyxl
+import pandas as pd
+
+sys.path.append(str(Path(__file__).parent))
+
+from agent_demande    import run as run_demande
+from agent_production import run as run_production
+from agent_marketing  import run as run_marketing
+from agent_finance    import run as run_finance
+from data_loader      import auto_load
+from excel_writer     import add_agent_watermark, save_workbook
+
+SCENARIOS = {
+    "analyse_complete": "Analyse S&OP complète (tous les agents)",
+    "promotion":        "Simulation d'une promotion commerciale",
+    "capacity_check":   "Vérification de la capacité de production",
+    "demand_only":      "Prévision de la demande uniquement",
+}
+
+SCENARIO_AGENTS = {
+    "analyse_complete": ["marketing", "demande", "production", "finance"],
+    "promotion":        ["marketing", "demande", "production", "finance"],
+    "capacity_check":   ["production"],
+    "demand_only":      ["demande"],
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DÉTECTION AUTOMATIQUE DES FICHIERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def detect_files(file_paths: list) -> dict:
+    """
+    Prend une liste de fichiers Excel et les catégorise automatiquement.
+    Retourne { "demand": path, "production": path }
+    """
+    detected = {"demand": None, "production": None}
+    for fp in file_paths:
+        try:
+            data = auto_load(fp)
+            if data["type"] == "demand" and not detected["demand"]:
+                detected["demand"] = fp
+            elif data["type"] == "production" and not detected["production"]:
+                detected["production"] = fp
+        except Exception as e:
+            print(f"  ⚠️  Impossible de lire {fp} : {e}")
+    return detected
+
+
+def auto_detect_in_folder(folder: str = ".") -> dict:
+    """Cherche automatiquement les fichiers Excel dans un dossier."""
+    files = list(Path(folder).glob("*.xlsx"))
+    files = [str(f) for f in files if not f.name.startswith("output_")]
+    return detect_files(files)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CONSTRUCTION DU CONTEXTE PAR AGENT
+# ═══════════════════════════════════════════════════════════════════════════
+
+def build_agent_context(agent: str, scenario: str, global_ctx: dict, file_map: dict, prev: dict) -> dict:
+    ctx = {
+        "scenario":    scenario,
+        "demand_file": file_map.get("demand"),
+        "prod_file":   file_map.get("production"),
+    }
+    ctx.update({k: v for k, v in global_ctx.items() if k not in ("demand_file", "prod_file")})
+
+    if agent == "marketing":
+        ctx["promo_horizon"] = global_ctx.get("promo_horizon", 3)
+        ctx["start_month"]   = global_ctx.get("start_month", 1)
+
+    elif agent == "demande":
+        mkt = prev.get("marketing", {})
+        ctx["uplift_marketing"] = mkt.get("uplift_moy_pct", 0)
+        ctx["horizon"]          = global_ctx.get("horizon", 6)
+
+    elif agent == "production":
+        dem = prev.get("demande", {})
+        ctx["demand_forecast_6m"] = sum(
+            s.get("forecast_total_6m", 0) for s in dem.get("selections", [])
+        )
+
+    elif agent == "finance":
+        mkt = prev.get("marketing", {})
+        dem = prev.get("demande", {})
+
+        # Construit le forecast et les uplifts à partir des vrais résultats
+        uplift_by_month = []
+        demand_forecast = []
+
+        for a in mkt.get("analyses", []):
+            if not uplift_by_month:
+                uplift_by_month = a.get("uplift_by_month", [])
+            if not demand_forecast:
+                demand_forecast = a.get("demand_forecast", [])
+
+        if not uplift_by_month:
+            u = mkt.get("uplift_moy_pct", 0)
+            uplift_by_month = [u, u * 0.7, u * 0.4]
+        if not demand_forecast:
+            sels = dem.get("selections", [])
+            base = sels[0].get("history_mean", 1000) if sels else 1000
+            demand_forecast = [base] * 3
+
+        ctx["uplift_pcts"]    = uplift_by_month
+        ctx["demand_forecast"] = demand_forecast
+
+    return ctx
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SYNTHÈSE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def synthesize(scenario: str, results: dict, context: dict) -> dict:
+    decision = {"scénario": scenario, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")}
+
+    if scenario in ("promotion", "analyse_complete"):
+        fin = results.get("finance", {})
+        mkt = results.get("marketing", {})
+        prd = results.get("production", {})
+        dem = results.get("demande", {})
+
+        roi       = fin.get("roi_moyen_pct", 0)
+        surges    = prd.get("surcharges_detectees", 0)
+        budget_ok = not fin.get("depassement", False)
+        uplift    = mkt.get("uplift_max_pct", 0)
+        mape_avg  = np.mean([s.get("mape", 100) for s in dem.get("selections", [{"mape": 100}])])
+
+        blockers = []
+        if roi < float(context.get("margin_target_pct", 10)):
+            blockers.append(f"ROI {roi:.1f}% < cible {context.get('margin_target_pct', 10)}%")
+        if not budget_ok:
+            blockers.append("Dépassement budget promotion")
+        if surges > 0:
+            blockers.append(f"{surges} période(s) en surcharge capacité")
+        if mape_avg > 50:
+            blockers.append(f"MAPE prévision élevé ({mape_avg:.0f}%) — forecast peu fiable")
+
+        go = len(blockers) == 0
+
+        decision.update({
+            "recommandation":    "✅ GO — Approuvé" if go else "❌ NO-GO — Conditions non remplies",
+            "ROI moyen (%)":     roi,
+            "Uplift demande (%)": uplift,
+            "Précision forecast MAPE (%)": round(mape_avg, 1),
+            "Surcharges prod":   surges,
+            "Budget OK":         budget_ok,
+            "Facteurs bloquants": blockers if blockers else ["Aucun"],
+        })
+
+    elif scenario == "capacity_check":
+        prd = results.get("production", {})
+        decision["recommandation"] = (
+            "✅ Capacité suffisante" if prd.get("capacity_ok") else
+            f"⚠️ {prd.get('surcharges_detectees', 0)} surcharge(s) à traiter"
+        )
+        decision.update(prd)
+
+    elif scenario == "demand_only":
+        dem = results.get("demande", {})
+        decision["recommandation"] = f"✅ Prévisions générées — {dem.get('articles_analysed', 0)} article(s)"
+        decision.update(dem)
+
+    return decision
+
+
+def write_synthesis(scenario: str, results: dict, decision: dict, output_path: str):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Synthèse Orchestrateur"
+
+    ws.merge_cells("A1:E1")
+    ws["A1"] = f"ORCHESTRATEUR S&OP — {scenario.upper()}"
+    ws["A1"].font  = openpyxl.styles.Font(bold=True, size=14, name="Calibri", color="26215C")
+    ws["A1"].fill  = openpyxl.styles.PatternFill("solid", fgColor="EEEDFE")
+    ws["A1"].alignment = openpyxl.styles.Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 36
+    ws.column_dimensions["A"].width = 35
+    ws.column_dimensions["B"].width = 55
+
+    row = 3
+    ws.cell(row=row, column=1, value="DÉCISION FINALE").font = openpyxl.styles.Font(bold=True, size=12)
+    row += 1
+    for k, v in decision.items():
+        ws.cell(row=row, column=1, value=str(k)).font = openpyxl.styles.Font(bold=True, name="Calibri")
+        ws.cell(row=row, column=2, value=str(v))
+        row += 1
+
+    row += 1
+    ws.cell(row=row, column=1, value="RÉSULTATS PAR AGENT").font = openpyxl.styles.Font(bold=True, size=12)
+    row += 1
+    for agent, res in results.items():
+        ws.cell(row=row, column=1, value=f"[{agent.upper()}]").font = openpyxl.styles.Font(bold=True)
+        row += 1
+        for k, v in res.items():
+            if k not in ("output_file", "selections", "analyses", "agent"):
+                ws.cell(row=row, column=1, value=f"  {k}")
+                ws.cell(row=row, column=2, value=str(v))
+                row += 1
+        row += 1
+
+    add_agent_watermark(ws, "orchestrateur", "Synthèse multi-agents autonome.")
+    save_workbook(wb, output_path)
+    return output_path
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# POINT D'ENTRÉE
+# ═══════════════════════════════════════════════════════════════════════════
+
+RUNNERS = {
+    "demande":    run_demande,
+    "production": run_production,
+    "marketing":  run_marketing,
+    "finance":    run_finance,
+}
+
+
+def run(scenario: str = "analyse_complete", context: dict = None, files: list = None) -> dict:
+    """
+    Lance le cycle S&OP complet.
+
+    Paramètres
+    ----------
+    scenario : str
+    context  : dict  — paramètres du scénario (discount_pct, article, etc.)
+    files    : list  — chemins des fichiers Excel uploadés par l'utilisateur
+    """
+    ctx = context or {}
+    print("\n" + "█"*60)
+    print(f"  ORCHESTRATEUR — {scenario.upper()}")
+    print("█"*60)
+
+    # 1. Détection automatique des fichiers
+    if files:
+        file_map = detect_files(files)
+    else:
+        file_map = auto_detect_in_folder(".")
+
+    print(f"  📁 Fichier demande    : {file_map.get('demand', 'Non trouvé')}")
+    print(f"  📁 Fichier production : {file_map.get('production', 'Non trouvé')}")
+
+    # Output dir = là où se trouvent les fichiers
+    out_dir = Path(file_map.get("demand") or file_map.get("production") or ".").parent
+    ctx["output_dir"] = str(out_dir)
+
+    # 2. Agents à appeler
+    agents = SCENARIO_AGENTS.get(scenario, ["demande"])
+    print(f"  🧠 Agents : {agents}")
+
+    # 3. Exécution séquentielle avec enrichissement progressif
+    results = {}
+    for agent in agents:
+        agent_ctx = build_agent_context(agent, scenario, ctx, file_map, results)
+        # Output path
+        agent_ctx["output_path"] = str(out_dir / f"output_agent_{agent}.xlsx")
+
+        print(f"\n  ▶ Agent {agent.upper()}...")
+        try:
+            results[agent] = RUNNERS[agent](context=agent_ctx)
+            print(f"  ◀ {agent.upper()} → {results[agent].get('status', 'done')}")
+        except Exception as e:
+            print(f"  ❌ {agent.upper()} ERREUR : {e}")
+            results[agent] = {"status": "error", "error": str(e)}
+
+    # 4. Synthèse
+    decision    = synthesize(scenario, results, ctx)
+    report_path = str(out_dir / "output_orchestrateur.xlsx")
+    write_synthesis(scenario, results, decision, report_path)
+
+    print("\n" + "█"*60)
+    print(f"  DÉCISION : {decision.get('recommandation', '—')}")
+    print("█"*60 + "\n")
+
+    return {
+        "scenario": scenario,
+        "decision": decision,
+        "agents":   results,
+        "report":   report_path,
+        "file_map": file_map,
+    }
+
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--scenario",  default="analyse_complete", choices=list(SCENARIOS.keys()))
+    p.add_argument("--discount",  type=float, default=0.0)
+    p.add_argument("--article",   default=None)
+    p.add_argument("--files",     nargs="+", default=None)
+    args = p.parse_args()
+    run(scenario=args.scenario, context={"discount_pct": args.discount, "article": args.article}, files=args.files)

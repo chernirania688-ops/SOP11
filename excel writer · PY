@@ -1,0 +1,97 @@
+"""
+Outil partagé : lecture et écriture Excel pour tous les agents S&OP.
+Chaque agent appelle UNIQUEMENT les fonctions qui concernent ses propres données.
+"""
+
+import pandas as pd
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from datetime import datetime
+from pathlib import Path
+
+
+# ── Couleurs par agent ───────────────────────────────────────────────────────
+COLORS = {
+    "demande":    {"header": "1D9E75", "accent": "E1F5EE", "text": "04342C"},
+    "production": {"header": "BA7517", "accent": "FAEEDA", "text": "412402"},
+    "marketing":  {"header": "D85A30", "accent": "FAECE7", "text": "4A1B0C"},
+    "finance":    {"header": "185FA5", "accent": "E6F1FB", "text": "042C53"},
+    "orchestrateur": {"header": "534AB7", "accent": "EEEDFE", "text": "26215C"},
+}
+
+thin = Side(style="thin", color="CCCCCC")
+BORDER = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+
+def _style_header(cell, agent: str):
+    c = COLORS[agent]
+    cell.fill = PatternFill("solid", fgColor=c["header"])
+    cell.font = Font(bold=True, color="FFFFFF", size=11, name="Calibri")
+    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    cell.border = BORDER
+
+
+def _style_data(cell, agent: str, shade: bool = False):
+    c = COLORS[agent]
+    cell.fill = PatternFill("solid", fgColor=c["accent"] if shade else "FFFFFF")
+    cell.font = Font(size=10, name="Calibri", color=c["text"])
+    cell.alignment = Alignment(horizontal="center", vertical="center")
+    cell.border = BORDER
+
+
+def _style_highlight(cell, agent: str):
+    """Cellule mise en évidence = meilleure valeur / alerte."""
+    c = COLORS[agent]
+    cell.fill = PatternFill("solid", fgColor=c["header"])
+    cell.font = Font(bold=True, color="FFFFFF", size=10, name="Calibri")
+    cell.alignment = Alignment(horizontal="center", vertical="center")
+    cell.border = BORDER
+
+
+def add_agent_watermark(ws, agent: str, message: str):
+    """Ajoute une note d'action horodatée dans la feuille."""
+    last_row = ws.max_row + 2
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    ws.cell(row=last_row, column=1, value=f"[Agent {agent.upper()} — {ts}] {message}")
+    cell = ws.cell(row=last_row, column=1)
+    cell.font = Font(italic=True, color="888888", size=9, name="Calibri")
+
+
+def read_excel_sheets(path: str) -> dict[str, pd.DataFrame]:
+    """Lecture de toutes les feuilles d'un fichier Excel."""
+    return pd.read_excel(path, sheet_name=None)
+
+
+def save_workbook(wb: openpyxl.Workbook, path: str):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    wb.save(path)
+    print(f"  ✅ Fichier sauvegardé : {path}")
+
+
+def write_dataframe_to_sheet(
+    ws,
+    df: pd.DataFrame,
+    agent: str,
+    start_row: int = 1,
+    highlight_col: str = None,
+    highlight_value=None,
+):
+    """Écrit un DataFrame dans une feuille avec mise en forme agent."""
+    # En-têtes
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        cell = ws.cell(row=start_row, column=col_idx, value=str(col_name))
+        _style_header(cell, agent)
+        ws.column_dimensions[get_column_letter(col_idx)].width = max(18, len(str(col_name)) + 4)
+
+    # Données
+    for row_idx, (_, row) in enumerate(df.iterrows(), start=start_row + 1):
+        shade = (row_idx % 2 == 0)
+        for col_idx, (col_name, val) in enumerate(row.items(), start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+            if highlight_col and col_name == highlight_col and val == highlight_value:
+                _style_highlight(cell, agent)
+            else:
+                _style_data(cell, agent, shade)
+
+    ws.row_dimensions[start_row].height = 30

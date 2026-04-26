@@ -1,0 +1,9 @@
+langchain
+langchain-anthropic
+langgraph
+openpyxl
+pandas
+numpy
+statsmodels
+scipy
+python-dotenv

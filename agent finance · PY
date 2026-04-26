@@ -1,0 +1,246 @@
+"""
+agent_finance.py — Agent Finance Générique
+==========================================
+Calcule le P&L, ROI, et budget pour n'importe quel scénario S&OP.
+Paramètres financiers configurables dans le contexte ou auto-estimés.
+"""
+
+import sys
+import warnings
+from pathlib import Path
+
+import numpy as np
+import openpyxl
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+sys.path.append(str(Path(__file__).parent))
+
+from data_loader import load_demand_file, get_clean_history
+from excel_writer import add_agent_watermark, save_workbook, write_dataframe_to_sheet
+
+AGENT_NAME = "finance"
+
+# Paramètres financiers par défaut (overridables par le contexte)
+DEFAULT_PARAMS = {
+    "price_per_unit":    28.0,
+    "cost_per_unit":     12.5,
+    "fixed_costs_month": 15000.0,
+    "budget_promo":      10000.0,
+    "margin_target_pct": 10.0,
+}
+
+
+def estimate_financials_from_history(history: pd.Series) -> dict:
+    """
+    Si aucun paramètre financier n'est fourni, l'agent estime des valeurs
+    cohérentes à partir du volume historique (heuristique S&OP générique).
+    """
+    if history is None or len(history) == 0:
+        return DEFAULT_PARAMS.copy()
+    mean_vol = float(history.mean())
+    # Hypothèse : prix unitaire ~ inversement proportionnel au volume
+    if mean_vol > 10000:
+        price = 8.0
+    elif mean_vol > 1000:
+        price = 28.0
+    else:
+        price = 120.0
+    cost  = price * 0.45
+    fixed = max(5000, mean_vol * price * 0.05)
+    return {
+        "price_per_unit":    price,
+        "cost_per_unit":     cost,
+        "fixed_costs_month": round(fixed, 0),
+        "budget_promo":      round(fixed * 0.7, 0),
+        "margin_target_pct": 10.0,
+    }
+
+
+def compute_pl_scenario(article_id: str, fin_params: dict, context: dict) -> pd.DataFrame:
+    """
+    Calcule le P&L complet pour un article et un scénario.
+    Reçoit les forecasts et uplifts des agents Demande et Marketing.
+    """
+    price      = fin_params["price_per_unit"]
+    cost       = fin_params["cost_per_unit"]
+    fixed      = fin_params["fixed_costs_month"]
+    discount   = context.get("discount_pct", 0) / 100
+    price_promo = price * (1 - discount)
+
+    # Récupère les données des autres agents
+    demand_fc  = context.get("demand_forecast", [])
+    uplift_pcts = context.get("uplift_pcts", [])
+    horizon    = max(len(demand_fc), len(uplift_pcts), 3)
+
+    rows = []
+    for i in range(horizon):
+        base_d  = float(demand_fc[i]) if i < len(demand_fc) else float(context.get("base_demand", 1000))
+        uplift  = float(uplift_pcts[i]) / 100 if i < len(uplift_pcts) else 0.0
+        promo_d = base_d * (1 + uplift)
+
+        rev_base   = base_d * price - fixed
+        rev_promo  = promo_d * price_promo - fixed
+        margin_base  = rev_base - base_d * cost
+        margin_promo = rev_promo - promo_d * cost
+        roi = (margin_promo - margin_base) / abs(margin_base) * 100 if margin_base != 0 else 0.0
+
+        target = fin_params["margin_target_pct"]
+        margin_rate = (margin_promo / rev_promo * 100) if rev_promo > 0 else 0
+        if margin_promo < 0:
+            status = "🔴 DÉFICIT"
+        elif roi < target:
+            status = f"🟡 ROI sous cible ({target}%)"
+        else:
+            status = "🟢 RENTABLE"
+
+        rows.append({
+            "Article":              article_id,
+            "Mois":                 f"M+{i+1}",
+            "Demande base [U]":     round(base_d, 0),
+            "Demande promo [U]":    round(promo_d, 0),
+            "Prix unitaire (€)":    price,
+            "Prix promo (€)":       round(price_promo, 2),
+            "CA base (€)":          round(rev_base, 0),
+            "CA promo (€)":         round(rev_promo, 0),
+            "Marge base (€)":       round(margin_base, 0),
+            "Marge promo (€)":      round(margin_promo, 0),
+            "Taux marge (%)":       round(margin_rate, 1),
+            "ROI (%)":              round(roi, 1),
+            "Statut":               status,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def check_budget(df_pl: pd.DataFrame, fin_params: dict, context: dict) -> dict:
+    """Vérifie si le coût total de la promo reste dans le budget."""
+    discount    = context.get("discount_pct", 0) / 100
+    price       = fin_params["price_per_unit"]
+    budget      = fin_params["budget_promo"]
+    total_promo = float(df_pl["Demande promo [U]"].sum())
+    promo_cost  = total_promo * price * discount
+    over        = promo_cost > budget
+
+    return {
+        "budget_alloué (€)":   budget,
+        "coût_promo_estimé (€)": round(promo_cost, 0),
+        "dépassement":          over,
+        "alerte":               f"⚠️ +{promo_cost - budget:,.0f}€ dépassement" if over else "✅ Dans le budget",
+        "pct_budget_utilisé":   round(promo_cost / budget * 100, 1) if budget > 0 else 0,
+    }
+
+
+def write_output(pl_tables: list, budget_results: list, context: dict, output_path: str):
+    wb = openpyxl.Workbook()
+    ws1 = wb.active
+    ws1.title = "P&L Scénario"
+    ws1.merge_cells("A1:M1")
+    disc = context.get("discount_pct", 0)
+    ws1["A1"] = f"AGENT FINANCE — P&L SCÉNARIO {'PROMOTION -' + str(disc) + '%' if disc else 'S&OP'}"
+    ws1["A1"].font  = openpyxl.styles.Font(bold=True, size=13, name="Calibri", color="042C53")
+    ws1["A1"].fill  = openpyxl.styles.PatternFill("solid", fgColor="E6F1FB")
+    ws1["A1"].alignment = openpyxl.styles.Alignment(horizontal="center", vertical="center")
+    ws1.row_dimensions[1].height = 32
+
+    cur = 3
+    for df_pl in pl_tables:
+        write_dataframe_to_sheet(ws1, df_pl, AGENT_NAME, start_row=cur)
+        cur += len(df_pl) + 3
+
+    ws2 = wb.create_sheet("Résumé Budget")
+    rows = budget_results
+    if rows:
+        write_dataframe_to_sheet(ws2, pd.DataFrame(rows), AGENT_NAME, start_row=1)
+    add_agent_watermark(ws1, AGENT_NAME, "P&L automatique. Paramètres estimés si non fournis.")
+
+    save_workbook(wb, output_path)
+    return output_path
+
+
+def run(context: dict = None) -> dict:
+    ctx = context or {}
+    print("\n" + "="*60)
+    print("🤖 AGENT FINANCE — DÉMARRAGE")
+    print("="*60)
+    if ctx:
+        print(f"  📩 Contexte : {ctx}")
+
+    demand_file = ctx.get("demand_file")
+    if not demand_file:
+        candidates = list(Path(".").glob("*.xlsx"))
+        demand_file = next(
+            (str(f) for f in candidates if "article" in f.name.lower() or "report" in f.name.lower()),
+            None
+        )
+
+    articles_hist = {}
+    if demand_file and Path(demand_file).exists():
+        data = load_demand_file(demand_file)
+        articles_hist = data["articles"]
+
+    article_filter = ctx.get("article_filter") or ctx.get("article")
+    if article_filter:
+        articles_hist = {k: v for k, v in articles_hist.items() if article_filter in k}
+
+    # Si pas de données : mode simulation pure
+    if not articles_hist:
+        articles_hist = {"Article": {"history": None, "all_fields": {}}}
+
+    pl_tables      = []
+    budget_results = []
+    roi_list       = []
+
+    for art_id, art_data in articles_hist.items():
+        history    = get_clean_history(art_data)
+        fin_params = estimate_financials_from_history(history)
+        # Override par le contexte si fourni
+        for k in DEFAULT_PARAMS:
+            if k in ctx:
+                fin_params[k] = ctx[k]
+
+        print(f"  💰 {art_id} | prix={fin_params['price_per_unit']}€ | coût={fin_params['cost_per_unit']}€")
+
+        df_pl = compute_pl_scenario(art_id, fin_params, ctx)
+        pl_tables.append(df_pl)
+
+        bgt = check_budget(df_pl, fin_params, ctx)
+        bgt["Article"] = art_id
+        budget_results.append(bgt)
+
+        roi_list.append(float(df_pl["ROI (%)"].mean()))
+        print(f"    ROI moyen={roi_list[-1]:.1f}% | {bgt['alerte']}")
+
+    output_path = ctx.get("output_path", "output_agent_finance.xlsx")
+    if demand_file:
+        output_path = str(Path(demand_file).parent / "output_agent_finance.xlsx")
+    write_output(pl_tables, budget_results, ctx, output_path)
+
+    any_over    = any(b.get("dépassement", False) for b in budget_results)
+    roi_global  = round(np.mean(roi_list), 1) if roi_list else 0
+
+    summary = {
+        "agent":            "finance",
+        "status":           "success",
+        "roi_moyen_pct":    roi_global,
+        "depassement":      any_over,
+        "budget_alerte":    "⚠️ Dépassement budget" if any_over else "✅ Budget respecté",
+        "nb_articles":      len(pl_tables),
+        "output_file":      output_path,
+    }
+
+    print(f"\n✅ Agent Finance — ROI global={roi_global}%")
+    print("="*60 + "\n")
+    return summary
+
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--file",     default=None)
+    p.add_argument("--discount", type=float, default=0.0)
+    args = p.parse_args()
+    result = run({"demand_file": args.file, "discount_pct": args.discount})
+    for k, v in result.items():
+        if k != "output_file":
+            print(f"  {k}: {v}")

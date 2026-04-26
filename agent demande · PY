@@ -1,0 +1,405 @@
+"""
+agent_demande.py — Agent Demande Générique
+==========================================
+Fonctionne avec TOUT fichier de demande ayant la structure article_report_merged.
+Détecte automatiquement les articles, les périodes, et choisit la meilleure
+méthode de prévision par article selon MAE/MAPE/RMSE.
+Écrit le plan de demande ajusté dans un fichier Excel.
+"""
+
+import sys
+import warnings
+from pathlib import Path
+
+import numpy as np
+import openpyxl
+import pandas as pd
+from statsmodels.tsa.holtwinters import ExponentialSmoothing, SimpleExpSmoothing
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+
+warnings.filterwarnings("ignore")
+sys.path.append(str(Path(__file__).parent))
+
+from data_loader import load_demand_file, get_clean_history, get_existing_forecast
+from excel_writer import add_agent_watermark, save_workbook, write_dataframe_to_sheet
+
+AGENT_NAME  = "demande"
+HORIZON     = 6  # mois de prévision future
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MODÈLES DE PRÉVISION
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _errors(actual: np.ndarray, predicted: np.ndarray):
+    mask = (actual > 0) & ~np.isnan(predicted)
+    if mask.sum() == 0:
+        return 9999, 9999, 9999
+    mae  = np.mean(np.abs(actual[mask] - predicted[mask]))
+    mape = np.mean(np.abs((actual[mask] - predicted[mask]) / actual[mask])) * 100
+    rmse = np.sqrt(np.mean((actual[mask] - predicted[mask]) ** 2))
+    return round(float(mae), 2), round(float(mape), 2), round(float(rmse), 2)
+
+
+def model_les(series: pd.Series, horizon: int):
+    vals = series.values.astype(float)
+    if len(vals) < 4:
+        return None
+    train, test = vals[:-horizon], vals[-horizon:] if len(vals) > horizon else vals
+    best_alpha, best_mae = 0.3, np.inf
+    for alpha in np.arange(0.1, 1.0, 0.1):
+        try:
+            fit  = SimpleExpSmoothing(train, initialization_method="estimated").fit(smoothing_level=alpha, optimized=False)
+            pred = fit.forecast(len(test))
+            mae  = np.mean(np.abs(test - pred))
+            if mae < best_mae:
+                best_mae, best_alpha = mae, alpha
+        except Exception:
+            continue
+    fit      = SimpleExpSmoothing(vals, initialization_method="estimated").fit(smoothing_level=best_alpha, optimized=False)
+    fitted   = fit.fittedvalues
+    forecast = fit.forecast(horizon)
+    n = min(horizon, len(vals))
+    mae, mape, rmse = _errors(vals[-n:], fitted[-n:])
+    return "LES", forecast, mae, mape, rmse, {"alpha": round(best_alpha, 2)}
+
+
+def model_hw(series: pd.Series, horizon: int):
+    vals = series.values.astype(float)
+    if len(vals) < 24:
+        return None
+    try:
+        fit      = ExponentialSmoothing(vals, trend="add", seasonal="add", seasonal_periods=12, initialization_method="estimated").fit(optimized=True)
+        fitted   = fit.fittedvalues
+        forecast = fit.forecast(horizon)
+        n = min(horizon, len(vals))
+        mae, mape, rmse = _errors(vals[-n:], fitted[-n:])
+        return "Holt-Winters", forecast, mae, mape, rmse, {
+            "alpha": round(fit.params["smoothing_level"], 3),
+            "beta":  round(fit.params["smoothing_trend"], 3),
+            "gamma": round(fit.params["smoothing_seasonal"], 3),
+        }
+    except Exception as e:
+        print(f"    ⚠️  HW: {e}")
+        return None
+
+
+def model_ma(series: pd.Series, horizon: int, window: int = None):
+    vals = series.values.astype(float)
+    if len(vals) < 4:
+        return None
+    w     = window or max(3, min(12, len(vals) // 4))
+    roll  = pd.Series(vals).rolling(window=w).mean().values
+    last  = np.nanmean(vals[-w:])
+    fc    = np.full(horizon, last)
+    n     = min(horizon, len(vals))
+    valid = ~np.isnan(roll[-n:])
+    mae, mape, rmse = _errors(vals[-n:][valid], roll[-n:][valid]) if valid.sum() > 0 else (9999, 9999, 9999)
+    return f"MA({w})", fc, mae, mape, rmse, {"window": w}
+
+
+def model_sarima(series: pd.Series, horizon: int):
+    vals = series.values.astype(float)
+    if len(vals) < 18:
+        return None
+    try:
+        seasonal = 12 if len(vals) >= 24 else 0
+        order    = (1, 1, 1)
+        s_order  = (1, 0, 1, seasonal) if seasonal else (0, 0, 0, 0)
+        fit      = SARIMAX(vals, order=order, seasonal_order=s_order, enforce_stationarity=False, enforce_invertibility=False).fit(disp=False, maxiter=100)
+        fitted   = fit.fittedvalues
+        forecast = fit.forecast(steps=horizon)
+        n        = min(horizon, len(vals))
+        mae, mape, rmse = _errors(vals[-n:], fitted[-n:])
+        label = f"SARIMA{order}x{s_order[:3]}[{seasonal}]" if seasonal else "ARIMA(1,1,1)"
+        return label, forecast, mae, mape, rmse, {"aic": round(fit.aic, 1)}
+    except Exception as e:
+        print(f"    ⚠️  SARIMA: {e}")
+        return None
+
+
+def model_naive(series: pd.Series, horizon: int):
+    """Naïf : répète la dernière valeur connue. Toujours disponible comme fallback."""
+    vals = series.values.astype(float)
+    last = float(vals[-1]) if len(vals) > 0 else 0.0
+    fc   = np.full(horizon, last)
+    n    = min(horizon, len(vals))
+    mae, mape, rmse = _errors(vals[-n:], np.full(n, vals[-n - 1] if len(vals) > n else last))
+    return "Naïf", fc, mae, mape, rmse, {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CLASSIFICATION DE LA SÉRIE (intermittente / stable / saisonnière)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def classify_series(series: pd.Series) -> str:
+    """L'agent réfléchit : quel type de série est-ce ?"""
+    vals    = series.values.astype(float)
+    n_zeros = np.sum(vals == 0) / len(vals)
+    cv      = np.std(vals) / (np.mean(vals) + 1e-9)
+
+    if n_zeros > 0.5:
+        return "intermittente"
+    if len(vals) >= 24:
+        try:
+            from statsmodels.tsa.stattools import acf
+            acf_vals = acf(vals, nlags=13, fft=True)
+            if abs(acf_vals[12]) > 0.3:
+                return "saisonnière"
+        except Exception:
+            pass
+    if cv < 0.2:
+        return "stable"
+    return "variable"
+
+
+def select_models_for_series(series_type: str, n_obs: int) -> list:
+    """L'agent choisit quels modèles appliquer selon le profil de la série."""
+    models = [model_naive]  # toujours en fallback
+    if series_type == "intermittente":
+        models = [model_ma, model_les, model_naive]
+    elif series_type == "saisonnière":
+        models = [model_hw, model_sarima, model_les, model_ma, model_naive]
+    elif series_type == "stable":
+        models = [model_les, model_ma, model_sarima, model_naive]
+    else:
+        models = [model_les, model_hw, model_ma, model_sarima, model_naive]
+    # Filtre selon le nombre d'observations
+    if n_obs < 18:
+        models = [m for m in models if m not in [model_sarima, model_hw]]
+        if not models:
+            models = [model_les, model_ma, model_naive]
+    return models
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ANALYSE PAR ARTICLE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def analyse_article(article_id: str, article_data: dict, context: dict) -> dict:
+    """
+    Analyse complète d'un article :
+    - Classifie la série
+    - Lance les modèles adaptés
+    - Sélectionne le meilleur
+    - Ajuste si contexte promotion
+    """
+    history = get_clean_history(article_data)
+    if len(history) < 4:
+        print(f"    ⚠️  {article_id} : historique insuffisant ({len(history)} points)")
+        return {}
+
+    series_type = classify_series(history)
+    models_to_run = select_models_for_series(series_type, len(history))
+
+    uplift_pct = context.get("uplift_marketing", 0)
+    horizon    = context.get("horizon", HORIZON)
+
+    print(f"\n  🔍 {article_id} | type={series_type} | n={len(history)} | uplift={uplift_pct}%")
+
+    results = []
+    for model_fn in models_to_run:
+        try:
+            res = model_fn(history, horizon)
+            if res is None:
+                continue
+            name, forecast, mae, mape, rmse, params = res
+            results.append({"Méthode": name, "MAE": mae, "MAPE(%)": mape, "RMSE": rmse,
+                            "Forecast": forecast, "Params": params})
+            print(f"    📊 {name:40s} MAE={mae:8.1f}  MAPE={mape:5.1f}%  RMSE={rmse:8.1f}")
+        except Exception as e:
+            print(f"    ⚠️  {model_fn.__name__}: {e}")
+
+    if not results:
+        return {}
+
+    df_r = pd.DataFrame(results)
+    for m in ["MAE", "MAPE(%)", "RMSE"]:
+        rng = df_r[m].max() - df_r[m].min()
+        df_r[f"{m}_n"] = (df_r[m] - df_r[m].min()) / rng if rng > 0 else 0.0
+    df_r["Score"] = (0.4 * df_r["MAPE(%)_n"] + 0.4 * df_r["MAE_n"] + 0.2 * df_r["RMSE_n"]).round(4)
+
+    best = df_r.loc[df_r["Score"].idxmin()]
+    forecast = best["Forecast"]
+
+    # Ajustement promo : l'agent réagit à l'uplift marketing
+    if uplift_pct > 0:
+        forecast = forecast * (1 + uplift_pct / 100)
+        print(f"    🎯 Uplift promo +{uplift_pct}% appliqué → forecast ajusté")
+
+    print(f"    ✅ MEILLEUR : {best['Méthode']} (score={best['Score']:.4f})")
+
+    return {
+        "article":      article_id,
+        "series_type":  series_type,
+        "n_obs":        len(history),
+        "best_method":  best["Méthode"],
+        "best_score":   float(best["Score"]),
+        "forecast":     forecast,
+        "forecast_raw": best["Forecast"],
+        "uplift_applied": uplift_pct,
+        "params":       best["Params"],
+        "all_results":  df_r[["Méthode", "MAE", "MAPE(%)", "RMSE", "Score"]],
+        "history_mean": float(history.mean()),
+        "history_std":  float(history.std()),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ÉCRITURE EXCEL
+# ═══════════════════════════════════════════════════════════════════════════
+
+def write_output(selections: list, output_path: str):
+    wb = openpyxl.Workbook()
+
+    # ── Feuille 1 : Résumé ─────────────────────────────────────────────────
+    ws1 = wb.active
+    ws1.title = "Résumé Demande"
+    ws1.merge_cells("A1:H1")
+    ws1["A1"] = "AGENT DEMANDE — SÉLECTION AUTOMATIQUE PAR ARTICLE"
+    ws1["A1"].font  = openpyxl.styles.Font(bold=True, size=13, name="Calibri", color="04342C")
+    ws1["A1"].fill  = openpyxl.styles.PatternFill("solid", fgColor="E1F5EE")
+    ws1["A1"].alignment = openpyxl.styles.Alignment(horizontal="center", vertical="center")
+    ws1.row_dimensions[1].height = 32
+
+    rows = []
+    for s in selections:
+        if not s:
+            continue
+        best_kpi = s["all_results"][s["all_results"]["Méthode"] == s["best_method"]].iloc[0]
+        rows.append({
+            "Article":         s["article"],
+            "Type série":      s["series_type"],
+            "N obs":           s["n_obs"],
+            "Meilleure méthode": s["best_method"],
+            "MAE":             best_kpi["MAE"],
+            "MAPE(%)":         best_kpi["MAPE(%)"],
+            "RMSE":            best_kpi["RMSE"],
+            "Score composite": s["best_score"],
+            "Uplift appliqué(%)": s["uplift_applied"],
+            "Forecast total 6M": round(float(np.sum(s["forecast"])), 0),
+        })
+    write_dataframe_to_sheet(ws1, pd.DataFrame(rows), AGENT_NAME, start_row=3)
+    add_agent_watermark(ws1, AGENT_NAME, "Classification auto + score composite 0.4×MAPE + 0.4×MAE + 0.2×RMSE")
+
+    # ── Feuille 2 : Comparaison KPIs par article ───────────────────────────
+    ws2 = wb.create_sheet("Comparaison KPIs")
+    cur = 1
+    for s in selections:
+        if not s:
+            continue
+        ws2.cell(row=cur, column=1, value=f"Article : {s['article']}  |  Type : {s['series_type']}  |  N obs : {s['n_obs']}")
+        ws2.cell(row=cur, column=1).font = openpyxl.styles.Font(bold=True, size=11, name="Calibri")
+        cur += 1
+        write_dataframe_to_sheet(ws2, s["all_results"], AGENT_NAME, start_row=cur,
+                                 highlight_col="Méthode", highlight_value=s["best_method"])
+        cur += len(s["all_results"]) + 3
+
+    # ── Feuille 3 : Plan de demande forecast ───────────────────────────────
+    ws3 = wb.create_sheet("Plan Demande")
+    ws3.merge_cells("A1:H1")
+    ws3["A1"] = f"PLAN DE DEMANDE — PRÉVISIONS {HORIZON} PROCHAINS MOIS"
+    ws3["A1"].font  = openpyxl.styles.Font(bold=True, size=13, name="Calibri", color="04342C")
+    ws3["A1"].fill  = openpyxl.styles.PatternFill("solid", fgColor="E1F5EE")
+    ws3["A1"].alignment = openpyxl.styles.Alignment(horizontal="center", vertical="center")
+    ws3.row_dimensions[1].height = 32
+
+    fc_rows = []
+    for s in selections:
+        if not s or s.get("forecast") is None:
+            continue
+        row = {"Article": s["article"], "Méthode": s["best_method"]}
+        for i, v in enumerate(s["forecast"], 1):
+            row[f"M+{i}"] = round(float(v), 0)
+        row["Total 6M"] = round(float(np.sum(s["forecast"])), 0)
+        fc_rows.append(row)
+    if fc_rows:
+        write_dataframe_to_sheet(ws3, pd.DataFrame(fc_rows), AGENT_NAME, start_row=3)
+    add_agent_watermark(ws3, AGENT_NAME, f"Horizon={HORIZON} mois. Méthode auto. Uplift promo intégré si applicable.")
+
+    save_workbook(wb, output_path)
+    return output_path
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# POINT D'ENTRÉE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run(context: dict = None) -> dict:
+    ctx = context or {}
+    print("\n" + "="*60)
+    print("🤖 AGENT DEMANDE — DÉMARRAGE")
+    print("="*60)
+    if ctx:
+        print(f"  📩 Contexte : {ctx}")
+
+    # 1. Récupère le fichier depuis le contexte ou cherche automatiquement
+    demand_file = ctx.get("demand_file")
+    if not demand_file:
+        # Cherche dans le dossier courant
+        candidates = list(Path(".").glob("*.xlsx"))
+        demand_file = next(
+            (str(f) for f in candidates if "article" in f.name.lower() or "report" in f.name.lower() or "merged" in f.name.lower()),
+            str(candidates[0]) if candidates else None
+        )
+
+    if not demand_file or not Path(demand_file).exists():
+        return {"agent": "demande", "status": "error", "error": "Aucun fichier de demande trouvé"}
+
+    # 2. Chargement générique
+    print(f"  📂 Chargement : {Path(demand_file).name}")
+    data = load_demand_file(demand_file)
+
+    # 3. Filtre article si demandé
+    article_filter = ctx.get("article_filter")
+    articles = {k: v for k, v in data["articles"].items()
+                if not article_filter or article_filter in k}
+
+    # 4. Analyse chaque article
+    selections = []
+    for art_id, art_data in articles.items():
+        sel = analyse_article(art_id, art_data, ctx)
+        selections.append(sel)
+
+    # 5. Écriture Excel
+    output_path = ctx.get("output_path", str(Path(demand_file).parent / "output_agent_demande.xlsx"))
+    write_output(selections, output_path)
+
+    # 6. Résumé pour l'orchestrateur
+    valid = [s for s in selections if s]
+    summary = {
+        "agent":   "demande",
+        "status":  "success",
+        "articles_analysed": len(valid),
+        "output_file": output_path,
+        "selections": [
+            {
+                "article":           s["article"],
+                "best_method":       s["best_method"],
+                "series_type":       s["series_type"],
+                "mape":              float(s["all_results"].loc[s["all_results"]["Méthode"] == s["best_method"], "MAPE(%)"].values[0]),
+                "forecast_total_6m": float(np.sum(s["forecast"])),
+                "forecast_monthly":  [round(float(v), 0) for v in s["forecast"]],
+                "history_mean":      s["history_mean"],
+            }
+            for s in valid
+        ],
+    }
+
+    print(f"\n✅ Agent Demande terminé — {len(valid)} article(s) analysé(s)")
+    print("="*60 + "\n")
+    return summary
+
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--file", default=None, help="Chemin du fichier Excel de demande")
+    p.add_argument("--horizon", type=int, default=6)
+    p.add_argument("--article", default=None)
+    args = p.parse_args()
+    HORIZON = args.horizon
+    result = run({"demand_file": args.file, "horizon": args.horizon, "article_filter": args.article})
+    print("\n📋 RÉSUMÉ :")
+    for s in result.get("selections", []):
+        print(f"  → {s['article']:30s} | {s['best_method']:35s} | MAPE={s['mape']:.1f}% | F6M={s['forecast_total_6m']:,.0f}")

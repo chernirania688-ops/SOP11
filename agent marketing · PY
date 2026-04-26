@@ -1,0 +1,213 @@
+"""
+agent_marketing.py — Agent Marketing Générique
+===============================================
+Analyse l'impact d'une promotion sur n'importe quel article,
+en utilisant les données historiques réelles issues du fichier demande.
+Calcule l'uplift, la saisonnalité, et ajuste le forecast en conséquence.
+"""
+
+import sys
+import warnings
+from pathlib import Path
+
+import numpy as np
+import openpyxl
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+sys.path.append(str(Path(__file__).parent))
+
+from data_loader import load_demand_file, get_clean_history
+from excel_writer import add_agent_watermark, save_workbook, write_dataframe_to_sheet
+
+AGENT_NAME = "marketing"
+
+
+def detect_seasonality_factor(history: pd.Series, month_idx: int) -> float:
+    """
+    Détecte le facteur saisonnier réel du mois cible à partir de l'historique.
+    month_idx : 1-12
+    """
+    vals = history.values.astype(float)
+    if len(vals) < 12:
+        return 1.0
+    mean = np.mean(vals[vals > 0])
+    if mean == 0:
+        return 1.0
+    # Reconstruit les indices mensuels cycliques
+    n = len(vals)
+    monthly_avgs = []
+    for m in range(12):
+        indices = [i for i in range(n) if i % 12 == m]
+        if indices:
+            monthly_avgs.append(np.mean([vals[i] for i in indices if vals[i] > 0]))
+        else:
+            monthly_avgs.append(mean)
+    seasonal_factors = [a / mean for a in monthly_avgs]
+    idx = (month_idx - 1) % 12
+    return float(seasonal_factors[idx])
+
+
+def compute_uplift(context: dict, history: pd.Series) -> list:
+    """
+    Calcule l'uplift réel sur le horizon de la promotion.
+    Intègre : remise, élasticité prix, saisonnalité réelle, decay temporel.
+    """
+    discount    = context.get("discount_pct", 20) / 100
+    elasticity  = abs(context.get("price_elasticity", -1.5))
+    base_demand = context.get("base_demand", float(history.mean()) if len(history) > 0 else 1000)
+    horizon     = context.get("promo_horizon", 3)
+    start_month = context.get("start_month", 1)
+
+    # Uplift de base = élasticité × remise
+    base_uplift = elasticity * discount
+
+    rows = []
+    for i in range(1, horizon + 1):
+        month_idx      = ((start_month + i - 2) % 12) + 1
+        seasonal_f     = detect_seasonality_factor(history, month_idx)
+        decay          = 1.0 - (i - 1) * 0.25  # déclin de 25% par mois
+        decay          = max(decay, 0.2)
+        uplift_pct     = base_uplift * decay * 100
+        adjusted_demand = base_demand * seasonal_f * (1 + uplift_pct / 100)
+
+        rows.append({
+            "Mois promo":         f"M+{i}",
+            "Indice mois":        month_idx,
+            "Demande base [U]":   round(base_demand * seasonal_f, 0),
+            "Remise (%)":         round(discount * 100, 1),
+            "Élasticité":         -elasticity,
+            "Facteur saisonnier": round(seasonal_f, 3),
+            "Decay temporel":     round(decay, 2),
+            "Uplift estimé (%)":  round(uplift_pct, 1),
+            "Demande prévue [U]": round(adjusted_demand, 0),
+            "Delta [U]":          round(adjusted_demand - base_demand * seasonal_f, 0),
+        })
+
+    return rows
+
+
+def analyse_article_promo(article_id: str, article_data: dict, context: dict) -> dict:
+    history = get_clean_history(article_data)
+    base_demand = float(history.tail(6).mean()) if len(history) >= 6 else float(history.mean()) if len(history) > 0 else 1000.0
+    context["base_demand"] = context.get("base_demand", base_demand)
+
+    rows = compute_uplift(context, history)
+    df   = pd.DataFrame(rows)
+
+    uplift_max     = df["Uplift estimé (%)"].max()
+    demand_peak    = df["Demande prévue [U]"].max()
+    uplift_moyen   = df["Uplift estimé (%)"].mean()
+
+    print(f"    📣 {article_id} | Uplift max={uplift_max:.1f}% | Pic={demand_peak:.0f} U | Base={base_demand:.0f}")
+
+    return {
+        "article":       article_id,
+        "base_demand":   round(base_demand, 0),
+        "uplift_max_pct": round(uplift_max, 1),
+        "uplift_moy_pct": round(uplift_moyen, 1),
+        "demand_peak":   round(demand_peak, 0),
+        "detail":        df,
+        "uplift_by_month": df["Uplift estimé (%)"].tolist(),
+        "demand_forecast":  df["Demande prévue [U]"].tolist(),
+    }
+
+
+def write_output(analyses: list, context: dict, output_path: str):
+    wb = openpyxl.Workbook()
+    ws1 = wb.active
+    ws1.title = "Impact Promotion"
+    ws1.merge_cells("A1:K1")
+    ws1["A1"] = f"AGENT MARKETING — SIMULATION PROMOTION -{context.get('discount_pct', 20)}%"
+    ws1["A1"].font  = openpyxl.styles.Font(bold=True, size=13, name="Calibri", color="4A1B0C")
+    ws1["A1"].fill  = openpyxl.styles.PatternFill("solid", fgColor="FAECE7")
+    ws1["A1"].alignment = openpyxl.styles.Alignment(horizontal="center", vertical="center")
+    ws1.row_dimensions[1].height = 32
+
+    cur = 3
+    for a in analyses:
+        ws1.cell(row=cur, column=1, value=f"Article : {a['article']}  |  Base = {a['base_demand']:.0f} U/mois")
+        ws1.cell(row=cur, column=1).font = openpyxl.styles.Font(bold=True, name="Calibri", size=11)
+        cur += 1
+        write_dataframe_to_sheet(ws1, a["detail"], AGENT_NAME, start_row=cur)
+        cur += len(a["detail"]) + 3
+
+    # Résumé global
+    ws2 = wb.create_sheet("Résumé Promo")
+    rows = [{
+        "Article": a["article"],
+        "Remise (%)": context.get("discount_pct", 20),
+        "Base [U/mois]": a["base_demand"],
+        "Uplift max (%)": a["uplift_max_pct"],
+        "Uplift moyen (%)": a["uplift_moy_pct"],
+        "Pic demande [U]": a["demand_peak"],
+    } for a in analyses]
+    write_dataframe_to_sheet(ws2, pd.DataFrame(rows), AGENT_NAME, start_row=1)
+    add_agent_watermark(ws2, AGENT_NAME, f"Modèle élasticité prix + saisonnalité réelle. Horizon={context.get('promo_horizon',3)} mois.")
+
+    save_workbook(wb, output_path)
+    return output_path
+
+
+def run(context: dict = None) -> dict:
+    ctx = context or {}
+    print("\n" + "="*60)
+    print("🤖 AGENT MARKETING — DÉMARRAGE")
+    print("="*60)
+    if ctx:
+        print(f"  📩 Contexte : {ctx}")
+
+    demand_file = ctx.get("demand_file")
+    if not demand_file:
+        candidates = list(Path(".").glob("*.xlsx"))
+        demand_file = next(
+            (str(f) for f in candidates if "article" in f.name.lower() or "report" in f.name.lower()),
+            str(candidates[0]) if candidates else None
+        )
+
+    analyses = []
+    if demand_file and Path(demand_file).exists():
+        data = load_demand_file(demand_file)
+        article_filter = ctx.get("article_filter") or ctx.get("article")
+        articles = {k: v for k, v in data["articles"].items()
+                    if not article_filter or article_filter in k}
+        for art_id, art_data in articles.items():
+            a = analyse_article_promo(art_id, art_data, ctx.copy())
+            analyses.append(a)
+    else:
+        # Mode sans données : utilise base_demand du contexte
+        a = analyse_article_promo("Article générique", {"history": None, "all_fields": {}}, ctx)
+        analyses.append(a)
+
+    output_path = ctx.get("output_path", "output_agent_marketing.xlsx")
+    if demand_file:
+        output_path = str(Path(demand_file).parent / "output_agent_marketing.xlsx")
+    write_output(analyses, ctx, output_path)
+
+    summary = {
+        "agent":           "marketing",
+        "status":          "success",
+        "articles":        [a["article"] for a in analyses],
+        "uplift_max_pct":  max(a["uplift_max_pct"] for a in analyses) if analyses else 0,
+        "uplift_moy_pct":  round(np.mean([a["uplift_moy_pct"] for a in analyses]), 1) if analyses else 0,
+        "demand_peak":     max(a["demand_peak"] for a in analyses) if analyses else 0,
+        "analyses":        analyses,
+        "output_file":     output_path,
+    }
+
+    print(f"\n✅ Agent Marketing terminé — {len(analyses)} article(s)")
+    print("="*60 + "\n")
+    return summary
+
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--file",     default=None)
+    p.add_argument("--discount", type=float, default=20.0)
+    p.add_argument("--article",  default=None)
+    args = p.parse_args()
+    result = run({"demand_file": args.file, "discount_pct": args.discount, "article": args.article})
+    for k, v in result.items():
+        if k not in ("analyses", "output_file"):
+            print(f"  {k}: {v}")

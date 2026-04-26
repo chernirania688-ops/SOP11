@@ -1,0 +1,284 @@
+"""
+agent_production.py — Agent Production Générique
+=================================================
+Fonctionne avec TOUT fichier MPS ayant la structure exemple_prod.xlsx.
+Détecte automatiquement les articles, ressources, indicateurs, périodes.
+Réfléchit sur la capacité, ajuste le plan et écrit dans Excel.
+"""
+
+import sys
+import warnings
+from pathlib import Path
+
+import numpy as np
+import openpyxl
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+sys.path.append(str(Path(__file__).parent))
+
+from data_loader import load_production_file, get_production_indicator
+from excel_writer import add_agent_watermark, save_workbook, write_dataframe_to_sheet
+
+AGENT_NAME = "production"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DÉTECTION AUTOMATIQUE DES INDICATEURS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def find_indicator(art_dict: dict, *keywords) -> pd.Series:
+    """Cherche un indicateur par mots-clés, insensible à la casse."""
+    kws = [k.lower() for k in keywords]
+    for key, series in art_dict.items():
+        k_low = key.lower()
+        if all(kw in k_low for kw in kws):
+            return series
+    return pd.Series(dtype=float)
+
+
+def detect_capacity(art_dict: dict) -> tuple:
+    """
+    Détecte automatiquement : capacité disponible, taux de charge, ressource.
+    Retourne (capacity_series, var_req_series, resource_name).
+    """
+    cap_series = find_indicator(art_dict, "available", "capacity")
+    var_series = find_indicator(art_dict, "variable", "requirement")
+
+    if cap_series.empty:
+        # Fallback : cherche n'importe quel indicateur contenant "capacity"
+        for key, s in art_dict.items():
+            if "capacity" in key.lower():
+                cap_series = s
+                break
+
+    if var_series.empty:
+        for key, s in art_dict.items():
+            if "variable" in key.lower() or ("requirement" in key.lower() and "gross" not in key.lower()):
+                var_series = s
+                break
+
+    resource = "Ressource"
+    for key in art_dict.keys():
+        if "capacity" in key.lower() or "requirement" in key.lower():
+            parts = key.split("[")
+            if len(parts) > 1:
+                resource = parts[-1].replace("]", "").strip()
+            break
+
+    return cap_series, var_series, resource
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ANALYSE CAPACITÉ
+# ═══════════════════════════════════════════════════════════════════════════
+
+def analyse_capacity(article_id: str, art_dict: dict, time_cols: list, context: dict) -> pd.DataFrame:
+    """
+    L'agent réfléchit :
+    1. Lit les besoins bruts
+    2. Calcule la charge = besoin × taux
+    3. Compare à la capacité disponible
+    4. Catégorise chaque période
+    """
+    gross    = find_indicator(art_dict, "gross", "requirement")
+    cap_s, var_s, resource = detect_capacity(art_dict)
+    safety   = find_indicator(art_dict, "safety", "stock")
+    min_prod = find_indicator(art_dict, "minimum", "production")
+    plan     = find_indicator(art_dict, "production", "plan")
+
+    # Capacité et taux : utilise la valeur médiane si variable
+    cap_default = float(cap_s.dropna().median()) if not cap_s.empty and cap_s.dropna().shape[0] > 0 else None
+    var_default = float(var_s.dropna().median()) if not var_s.empty and var_s.dropna().shape[0] > 0 else None
+
+    rows = []
+    for w in time_cols:
+        g = float(gross.get(w, 0) or 0) if not gross.empty else 0
+        c = float(cap_s.get(w, cap_default) or cap_default or 0) if not cap_s.empty else (cap_default or 0)
+        v = float(var_s.get(w, var_default) or var_default or 0) if not var_s.empty else (var_default or 0)
+        ss = float(safety.get(w, 0) or 0) if not safety.empty else 0
+        mp = float(min_prod.get(w, 0) or 0) if not min_prod.empty else 0
+        pp = float(plan.get(w, 0) or 0) if not plan.empty else 0
+
+        charge = g * v if v > 0 else g
+        surplus = c - charge if c > 0 else None
+
+        if c <= 0:
+            status = "⚪ Capacité inconnue"
+        elif surplus is not None and surplus < 0:
+            status = "🔴 SURCHARGE"
+        elif surplus is not None and surplus < c * 0.15:
+            status = "🟡 ALERTE (< 15% dispo)"
+        else:
+            status = "🟢 OK"
+
+        rows.append({
+            "Période":          w,
+            "Article":          article_id,
+            "Ressource":        resource,
+            "Besoin brut [U]":  round(g, 0),
+            f"Charge [{resource}]": round(charge, 1) if v > 0 else "N/A",
+            f"Capacité [{resource}]": round(c, 1) if c > 0 else "N/A",
+            "Surplus":          round(surplus, 1) if surplus is not None else "N/A",
+            "Safety stock [U]": round(ss, 1),
+            "Plan prod [U]":    round(pp, 0),
+            "Statut":           status,
+        })
+
+    return pd.DataFrame(rows)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AJUSTEMENT AUTOMATIQUE DU PLAN
+# ═══════════════════════════════════════════════════════════════════════════
+
+def generate_adjusted_plan(df: pd.DataFrame, art_dict: dict) -> pd.DataFrame:
+    """
+    L'agent agit comme un planificateur :
+    - Si surcharge → réduit au max possible
+    - Si alerte → recommande surveillance
+    - Si OK → maintient le plan
+    - Propose le report de production si pic détecté
+    """
+    df = df.copy()
+    cap_s, var_s, resource = detect_capacity(art_dict)
+    var_default = float(var_s.dropna().median()) if not var_s.empty and var_s.dropna().shape[0] > 0 else None
+
+    adjustments = []
+    for i, row in df.iterrows():
+        statut = row["Statut"]
+        g      = row["Besoin brut [U]"]
+        c_val  = row.get(f"Capacité [{resource}]", None)
+        v_val  = var_default
+
+        if statut == "🔴 SURCHARGE" and c_val and c_val != "N/A" and v_val and v_val > 0:
+            max_u = float(c_val) / v_val
+            action = f"Réduit {g:.0f}→{max_u:.0f} U (cap. max)"
+            adjustments.append({"Période": row["Période"], "Plan ajusté [U]": round(max_u, 0), "Action": action})
+        elif statut == "🟡 ALERTE (< 15% dispo)":
+            action = "Surveillance requise — faible marge capacité"
+            adjustments.append({"Période": row["Période"], "Plan ajusté [U]": g, "Action": action})
+        else:
+            adjustments.append({"Période": row["Période"], "Plan ajusté [U]": g, "Action": "Plan maintenu"})
+
+    df_adj = pd.DataFrame(adjustments)
+    return df.merge(df_adj, on="Période", how="left")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ÉCRITURE EXCEL
+# ═══════════════════════════════════════════════════════════════════════════
+
+def write_output(analyses: dict, output_path: str):
+    wb = openpyxl.Workbook()
+    ws1 = wb.active
+    ws1.title = "Analyse Capacité"
+    ws1.merge_cells("A1:K1")
+    ws1["A1"] = "AGENT PRODUCTION — ANALYSE CAPACITÉ & PLAN AJUSTÉ"
+    ws1["A1"].font  = openpyxl.styles.Font(bold=True, size=13, name="Calibri", color="412402")
+    ws1["A1"].fill  = openpyxl.styles.PatternFill("solid", fgColor="FAEEDA")
+    ws1["A1"].alignment = openpyxl.styles.Alignment(horizontal="center", vertical="center")
+    ws1.row_dimensions[1].height = 32
+
+    all_rows = []
+    for art_id, (df_cap, df_adj) in analyses.items():
+        all_rows.append(df_adj)
+    if all_rows:
+        df_all = pd.concat(all_rows, ignore_index=True)
+        write_dataframe_to_sheet(ws1, df_all, AGENT_NAME, start_row=3)
+    add_agent_watermark(ws1, AGENT_NAME, "Analyse automatique capacité. Ajustements si surcharge détectée.")
+
+    # Feuille résumé surcharges
+    ws2 = wb.create_sheet("Alertes & Surcharges")
+    ws2["A1"] = "ALERTES DÉTECTÉES"
+    ws2["A1"].font = openpyxl.styles.Font(bold=True, size=13, name="Calibri")
+    all_alerts = []
+    for art_id, (df_cap, df_adj) in analyses.items():
+        alerts = df_adj[df_adj["Statut"].isin(["🔴 SURCHARGE", "🟡 ALERTE (< 15% dispo)"])]
+        all_alerts.append(alerts)
+    if all_alerts:
+        df_alerts = pd.concat(all_alerts, ignore_index=True)
+        if not df_alerts.empty:
+            write_dataframe_to_sheet(ws2, df_alerts, AGENT_NAME, start_row=3)
+        else:
+            ws2["A3"] = "✅ Aucune surcharge détectée"
+    add_agent_watermark(ws2, AGENT_NAME, "Périodes nécessitant une action de planification.")
+
+    save_workbook(wb, output_path)
+    return output_path
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# POINT D'ENTRÉE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run(context: dict = None) -> dict:
+    ctx = context or {}
+    print("\n" + "="*60)
+    print("🤖 AGENT PRODUCTION — DÉMARRAGE")
+    print("="*60)
+    if ctx:
+        print(f"  📩 Contexte : {ctx}")
+
+    # Fichier
+    prod_file = ctx.get("prod_file")
+    if not prod_file:
+        candidates = list(Path(".").glob("*.xlsx"))
+        prod_file = next(
+            (str(f) for f in candidates if "prod" in f.name.lower() or "mps" in f.name.lower() or "exemple" in f.name.lower()),
+            str(candidates[0]) if candidates else None
+        )
+
+    if not prod_file or not Path(prod_file).exists():
+        return {"agent": "production", "status": "error", "error": "Aucun fichier production trouvé"}
+
+    print(f"  📂 Chargement : {Path(prod_file).name}")
+    data = load_production_file(prod_file)
+
+    analyses = {}
+    total_surcharges = []
+    total_alertes    = []
+
+    for art_id, art_dict in data["articles"].items():
+        print(f"\n  🏭 Article : {art_id}")
+        df_cap = analyse_capacity(art_id, art_dict, data["time_cols"], ctx)
+        df_adj = generate_adjusted_plan(df_cap, art_dict)
+        analyses[art_id] = (df_cap, df_adj)
+
+        surcharges = df_adj[df_adj["Statut"] == "🔴 SURCHARGE"]["Période"].tolist()
+        alertes    = df_adj[df_adj["Statut"] == "🟡 ALERTE (< 15% dispo)"]["Période"].tolist()
+        total_surcharges.extend(surcharges)
+        total_alertes.extend(alertes)
+        print(f"    Surcharges : {len(surcharges)} | Alertes : {len(alertes)}")
+
+    output_path = ctx.get("output_path", str(Path(prod_file).parent / "output_agent_production.xlsx"))
+    write_output(analyses, output_path)
+
+    summary = {
+        "agent":               "production",
+        "status":              "success",
+        "articles_analysed":   len(analyses),
+        "periodes_analysees":  len(data["time_cols"]),
+        "surcharges_detectees": len(total_surcharges),
+        "alertes_detectees":   len(total_alertes),
+        "periodes_surcharge":  total_surcharges,
+        "periodes_alerte":     total_alertes,
+        "output_file":         output_path,
+        "capacity_ok":         len(total_surcharges) == 0,
+    }
+
+    print(f"\n✅ Agent Production — surcharges={len(total_surcharges)} | alertes={len(total_alertes)}")
+    print("="*60 + "\n")
+    return summary
+
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--file", default=None)
+    args = p.parse_args()
+    result = run({"prod_file": args.file})
+    print("\n📋 RÉSUMÉ :")
+    for k, v in result.items():
+        if k != "output_file":
+            print(f"  {k}: {v}")
