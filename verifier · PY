@@ -1,0 +1,57 @@
+"""
+verifier.py — Vérifie que tout est en ordre avant de lancer l'app
+Utilisation : python verifier.py
+"""
+import sys
+import subprocess
+from pathlib import Path
+
+print("=" * 55)
+print("  VÉRIFICATION S&OP AGENTIQUE")
+print("=" * 55)
+
+# 1. Fichiers requis
+REQUIRED_PY = [
+    "app.py", "data_loader.py", "excel_writer.py",
+    "agent_demande.py", "agent_production.py",
+    "agent_marketing.py", "agent_finance.py", "orchestrateur.py"
+]
+REQUIRED_XLSX = [
+    "exemple_prod.xlsx", "article_report_merged.xlsx"
+]
+
+dossier = Path(__file__).parent
+print(f"\n📁 Dossier : {dossier}\n")
+
+all_ok = True
+for f in REQUIRED_PY + REQUIRED_XLSX:
+    exists = (dossier / f).exists()
+    icon = "✅" if exists else "❌"
+    print(f"  {icon}  {f}")
+    if not exists: all_ok = False
+
+# 2. Packages Python
+print("\n📦 Packages Python :")
+packages = ["streamlit", "pandas", "numpy", "openpyxl", "statsmodels", "scipy"]
+missing = []
+for pkg in packages:
+    try:
+        __import__(pkg)
+        print(f"  ✅  {pkg}")
+    except ImportError:
+        print(f"  ❌  {pkg}  ← À INSTALLER")
+        missing.append(pkg)
+        all_ok = False
+
+# 3. Résultat
+print()
+if all_ok:
+    print("✅ TOUT EST OK — Lance : streamlit run app.py")
+else:
+    print("⚠️  PROBLÈMES DÉTECTÉS :\n")
+    if missing:
+        print(f"  Installe les packages manquants :")
+        print(f"  pip install {' '.join(missing)}\n")
+    print("  Puis relance : streamlit run app.py")
+
+print("=" * 55)
